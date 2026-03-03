@@ -9,9 +9,11 @@ import com.jjenus.qipi.model.UploadPartResult;
 
 import java.io.*;
 import java.net.URL;
+import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -23,6 +25,8 @@ public class LocalStorageProvider implements Storage {
     private final Path rootPath;
     private final StorageConfig config;
     private final Map<String, MultipartUpload> activeMultipartUploads = new ConcurrentHashMap<>();
+    private final Thread cleanupThread;
+    private volatile boolean running = true;
     
     private static class MultipartUpload {
         final String uploadId;
@@ -30,7 +34,7 @@ public class LocalStorageProvider implements Storage {
         final String objectKey;
         final String contentType;
         final Map<String, String> metadata;
-        final List<UploadPartResult> parts = new ArrayList<>();
+        final List<UploadPartResult> parts = Collections.synchronizedList(new ArrayList<>());
         final Path tempDir;
         final Instant createdAt;
         
@@ -46,14 +50,63 @@ public class LocalStorageProvider implements Storage {
         }
     }
     
-    public LocalStorageProvider(StorageConfig config) throws IOException {
+    public LocalStorageProvider(StorageConfig config) throws StorageException {
         this.config = config;
-        this.rootPath = Paths.get(config.getBasePath()).toAbsolutePath();
-        Files.createDirectories(rootPath);
+        try {
+            this.rootPath = Paths.get(config.getBasePath()).toAbsolutePath().normalize();
+            Files.createDirectories(rootPath);
+        } catch (IOException e) {
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to initialize local storage at path: " + config.getBasePath(), e);
+        }
+        
+        // Start cleanup thread for stale multipart uploads
+        this.cleanupThread = new Thread(this::cleanupTask);
+        this.cleanupThread.setDaemon(true);
+        this.cleanupThread.start();
+    }
+    
+    private void cleanupTask() {
+        while (running) {
+            try {
+                Thread.sleep(3600000); // 1 hour
+                cleanupStaleMultipartUploads();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+    
+    private void cleanupStaleMultipartUploads() {
+        Instant cutoff = Instant.now().minusSeconds(86400); // 24 hours
+        List<String> staleUploads = activeMultipartUploads.entrySet().stream()
+            .filter(entry -> entry.getValue().createdAt.isBefore(cutoff))
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toList());
+        
+        for (String uploadId : staleUploads) {
+            MultipartUpload upload = activeMultipartUploads.remove(uploadId);
+            if (upload != null) {
+                try {
+                    deleteDirectory(upload.tempDir);
+                } catch (IOException e) {
+                    // Log but continue - use System.err for now, consider adding proper logging
+                    System.err.println("Failed to delete stale multipart upload directory: " + e.getMessage());
+                }
+            }
+        }
     }
     
     private Path getBucketPath(String bucketName) throws StorageException {
-        Path bucketPath = rootPath.resolve(bucketName);
+        Path bucketPath = rootPath.resolve(bucketName).normalize();
+        
+        // Security check - ensure path is within root
+        if (!bucketPath.startsWith(rootPath)) {
+            throw new StorageException(StorageException.ErrorCode.ACCESS_DENIED,
+                "Invalid bucket path", bucketName, null);
+        }
+        
         if (!Files.exists(bucketPath)) {
             throw new StorageException(StorageException.ErrorCode.BUCKET_NOT_FOUND,
                 "Bucket does not exist: " + bucketName, bucketName, null);
@@ -62,20 +115,21 @@ public class LocalStorageProvider implements Storage {
     }
     
     private Path getObjectPath(String bucketName, String objectKey) throws StorageException {
-        Path bucketPath = getBucketPath(bucketName);
+        Path bucketPath = rootPath.resolve(bucketName).normalize();
         
-        // Sanitize object key to prevent path traversal
-        String sanitizedKey = objectKey.replace("..", "").replace("/", File.separator);
-        Path objectPath = bucketPath.resolve(sanitizedKey);
+        // Security check - ensure bucket path is within root
+        if (!bucketPath.startsWith(rootPath)) {
+            throw new StorageException(StorageException.ErrorCode.ACCESS_DENIED,
+                "Invalid bucket path", bucketName, null);
+        }
+        
+        // Normalize and resolve object key
+        Path objectPath = bucketPath.resolve(objectKey).normalize();
         
         // Ensure the resolved path is still within the bucket
-        try {
-            if (!objectPath.toRealPath().startsWith(bucketPath.toRealPath())) {
-                throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
-                    "Invalid object key: path traversal detected", bucketName, objectKey);
-            }
-        } catch (IOException e) {
-            throw new StorageException("Error resolving path", e);
+        if (!objectPath.startsWith(bucketPath)) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                "Invalid object key: path traversal detected", bucketName, objectKey);
         }
         
         return objectPath;
@@ -84,27 +138,37 @@ public class LocalStorageProvider implements Storage {
     @Override
     public void createBucket(String bucketName) throws StorageException {
         try {
-            Path bucketPath = rootPath.resolve(bucketName);
+            Path bucketPath = rootPath.resolve(bucketName).normalize();
+            
+            // Security check
+            if (!bucketPath.startsWith(rootPath)) {
+                throw new StorageException(StorageException.ErrorCode.ACCESS_DENIED,
+                    "Invalid bucket name", bucketName, null);
+            }
+            
             Files.createDirectories(bucketPath);
         } catch (IOException e) {
-            throw new StorageException("Failed to create bucket: " + bucketName, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to create bucket: " + bucketName, e);
         }
     }
     
     @Override
     public boolean bucketExists(String bucketName) throws StorageException {
-        Path bucketPath = rootPath.resolve(bucketName);
+        Path bucketPath = rootPath.resolve(bucketName).normalize();
+        
+        // Security check
+        if (!bucketPath.startsWith(rootPath)) {
+            return false;
+        }
+        
         return Files.exists(bucketPath) && Files.isDirectory(bucketPath);
     }
     
     @Override
     public void deleteBucket(String bucketName) throws StorageException {
         try {
-            Path bucketPath = rootPath.resolve(bucketName);
-            if (!Files.exists(bucketPath)) {
-                throw new StorageException(StorageException.ErrorCode.BUCKET_NOT_FOUND,
-                    "Bucket not found: " + bucketName, bucketName, null);
-            }
+            Path bucketPath = getBucketPath(bucketName);
             
             // Check if bucket is empty
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(bucketPath)) {
@@ -116,7 +180,8 @@ public class LocalStorageProvider implements Storage {
             
             Files.delete(bucketPath);
         } catch (IOException e) {
-            throw new StorageException("Failed to delete bucket: " + bucketName, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to delete bucket: " + bucketName, e);
         }
     }
     
@@ -131,7 +196,8 @@ public class LocalStorageProvider implements Storage {
             }
             return buckets;
         } catch (IOException e) {
-            throw new StorageException("Failed to list buckets", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to list buckets", e);
         }
     }
     
@@ -139,13 +205,14 @@ public class LocalStorageProvider implements Storage {
     public FileInfo putObject(String bucketName, String objectKey, InputStream data,
                               long contentLength, String contentType,
                               Map<String, String> metadata) throws StorageException {
+        Path objectPath = null;
         try {
-            Path bucketPath = rootPath.resolve(bucketName);
+            Path bucketPath = rootPath.resolve(bucketName).normalize();
             if (!Files.exists(bucketPath)) {
                 createBucket(bucketName);
             }
             
-            Path objectPath = bucketPath.resolve(objectKey);
+            objectPath = getObjectPath(bucketName, objectKey);
             Files.createDirectories(objectPath.getParent());
             
             // Calculate ETag (MD5 of content)
@@ -166,14 +233,51 @@ public class LocalStorageProvider implements Storage {
             byte[] digest = md.digest();
             String etag = bytesToHex(digest);
             
+            // Save metadata
+            if (metadata != null || contentType != null) {
+                saveMetadata(objectPath, contentType, metadata);
+            }
+            
             FileInfo fileInfo = new FileInfo(bucketName, objectKey, contentLength, Instant.now());
             fileInfo.setEtag(etag);
             fileInfo.setContentType(contentType);
             fileInfo.setUserMetadata(metadata != null ? metadata : new HashMap<>());
             
             return fileInfo;
-        } catch (Exception e) {
-            throw new StorageException("Failed to put object: " + objectKey, e);
+            
+        } catch (NoSuchAlgorithmException e) {
+            // This shouldn't happen as MD5 is always available
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "MD5 algorithm not available", e);
+        } catch (IOException e) {
+            // Clean up partial file if upload failed
+            if (objectPath != null) {
+                try {
+                    Files.deleteIfExists(objectPath);
+                } catch (IOException ex) {
+                    // Ignore cleanup errors
+                }
+            }
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to put object: " + objectKey, e);
+        }
+    }
+    
+    private void saveMetadata(Path objectPath, String contentType, Map<String, String> metadata) 
+            throws IOException {
+        Path metaPath = objectPath.resolveSibling(objectPath.getFileName() + ".meta");
+        Properties props = new Properties();
+        
+        if (contentType != null) {
+            props.setProperty("content-type", contentType);
+        }
+        
+        if (metadata != null) {
+            props.putAll(metadata);
+        }
+        
+        try (OutputStream os = Files.newOutputStream(metaPath, StandardOpenOption.CREATE)) {
+            props.store(os, "File metadata");
         }
     }
     
@@ -181,9 +285,10 @@ public class LocalStorageProvider implements Storage {
     public FileInfo putObject(String bucketName, String objectKey, byte[] data,
                               String contentType, Map<String, String> metadata) 
             throws StorageException {
-        try (ByteArrayInputStream bais = new ByteArrayInputStream(data)) {
-            return putObject(bucketName, objectKey, bais, data.length, contentType, metadata);
-        }
+        // Using ByteArrayInputStream without try-with-resources since it doesn't need closing
+        ByteArrayInputStream bais = new ByteArrayInputStream(data);
+        return putObject(bucketName, objectKey, bais, data.length, contentType, metadata);
+        // No need to close ByteArrayInputStream - it's a no-op
     }
     
     @Override
@@ -198,7 +303,8 @@ public class LocalStorageProvider implements Storage {
             
             return Files.newInputStream(objectPath);
         } catch (IOException e) {
-            throw new StorageException("Failed to get object: " + objectKey, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to get object: " + objectKey, e);
         }
     }
     
@@ -216,15 +322,53 @@ public class LocalStorageProvider implements Storage {
             RandomAccessFile raf = new RandomAccessFile(objectPath.toFile(), "r");
             raf.seek(start);
             
-            // Create a limited input stream for the range
-            long length = end - start + 1;
-            byte[] buffer = new byte[(int)length];
-            raf.read(buffer);
-            raf.close();
-            
-            return new ByteArrayInputStream(buffer);
+            // Return channel as InputStream for efficient streaming
+            return new InputStream() {
+                private final FileChannel channel = raf.getChannel();
+                private long position = start;
+                private final long endPosition = end;
+                
+                @Override
+                public int read() throws IOException {
+                    if (position > endPosition) {
+                        return -1;
+                    }
+                    byte[] b = new byte[1];
+                    int read = channel.read(java.nio.ByteBuffer.wrap(b), position);
+                    if (read == 1) {
+                        position++;
+                        return b[0] & 0xFF;
+                    }
+                    return -1;
+                }
+                
+                @Override
+                public int read(byte[] b, int off, int len) throws IOException {
+                    if (position > endPosition) {
+                        return -1;
+                    }
+                    long remaining = endPosition - position + 1;
+                    int bytesToRead = (int) Math.min(len, remaining);
+                    if (bytesToRead <= 0) {
+                        return -1;
+                    }
+                    java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(b, off, bytesToRead);
+                    int read = channel.read(buf, position);
+                    if (read > 0) {
+                        position += read;
+                    }
+                    return read;
+                }
+                
+                @Override
+                public void close() throws IOException {
+                    channel.close();
+                    raf.close();
+                }
+            };
         } catch (IOException e) {
-            throw new StorageException("Failed to get object range: " + objectKey, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to get object range: " + objectKey, e);
         }
     }
     
@@ -234,20 +378,27 @@ public class LocalStorageProvider implements Storage {
             Path objectPath = getObjectPath(bucketName, objectKey);
             Files.deleteIfExists(objectPath);
             
+            // Delete metadata if exists
+            Path metaPath = objectPath.resolveSibling(objectPath.getFileName() + ".meta");
+            Files.deleteIfExists(metaPath);
+            
             // Clean up empty parent directories
             Path parent = objectPath.getParent();
-            Path bucketPath = rootPath.resolve(bucketName);
+            Path bucketPath = rootPath.resolve(bucketName).normalize();
             
             while (parent != null && !parent.equals(bucketPath)) {
                 try (DirectoryStream<Path> stream = Files.newDirectoryStream(parent)) {
                     if (!stream.iterator().hasNext()) {
                         Files.delete(parent);
+                        parent = parent.getParent();
+                    } else {
+                        break;
                     }
                 }
-                parent = parent.getParent();
             }
         } catch (IOException e) {
-            throw new StorageException("Failed to delete object: " + objectKey, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to delete object: " + objectKey, e);
         }
     }
     
@@ -276,7 +427,8 @@ public class LocalStorageProvider implements Storage {
             activeMultipartUploads.put(uploadId, upload);
             return uploadId;
         } catch (IOException e) {
-            throw new StorageException("Failed to initiate multipart upload", e);
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "Failed to initiate multipart upload", e);
         }
     }
     
@@ -286,7 +438,8 @@ public class LocalStorageProvider implements Storage {
             throws StorageException {
         MultipartUpload upload = activeMultipartUploads.get(uploadId);
         if (upload == null) {
-            throw new StorageException("Invalid upload ID: " + uploadId);
+            throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                "Invalid upload ID: " + uploadId, bucketName, objectKey);
         }
         
         try {
@@ -312,8 +465,12 @@ public class LocalStorageProvider implements Storage {
             upload.parts.add(result);
             
             return result;
-        } catch (Exception e) {
-            throw new StorageException("Failed to upload part " + partNumber, e);
+        } catch (NoSuchAlgorithmException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "MD5 algorithm not available", e);
+        } catch (IOException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "Failed to upload part " + partNumber, e);
         }
     }
     
@@ -323,7 +480,8 @@ public class LocalStorageProvider implements Storage {
             throws StorageException {
         MultipartUpload upload = activeMultipartUploads.remove(uploadId);
         if (upload == null) {
-            throw new StorageException("Invalid upload ID: " + uploadId);
+            throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                "Invalid upload ID: " + uploadId, bucketName, objectKey);
         }
         
         try {
@@ -347,6 +505,9 @@ public class LocalStorageProvider implements Storage {
                 }
             }
             
+            // Save metadata
+            saveMetadata(finalPath, upload.contentType, upload.metadata);
+            
             // Clean up temp directory
             deleteDirectory(upload.tempDir);
             
@@ -360,8 +521,12 @@ public class LocalStorageProvider implements Storage {
             fileInfo.setMultipart(true);
             
             return fileInfo;
-        } catch (Exception e) {
-            throw new StorageException("Failed to complete multipart upload", e);
+        } catch (NoSuchAlgorithmException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "MD5 algorithm not available", e);
+        } catch (IOException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "Failed to complete multipart upload", e);
         }
     }
     
@@ -373,7 +538,8 @@ public class LocalStorageProvider implements Storage {
             try {
                 deleteDirectory(upload.tempDir);
             } catch (IOException e) {
-                throw new StorageException("Failed to abort multipart upload", e);
+                throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                    "Failed to abort multipart upload", e);
             }
         }
     }
@@ -399,7 +565,7 @@ public class LocalStorageProvider implements Storage {
             
             String signingKey = config.getSigningKey();
             if (signingKey == null) {
-                signingKey = "default-signing-key";
+                signingKey = "default-signing-key-change-this";
             }
             
             long expiryTime = Instant.now().plusSeconds(expiryInSeconds).toEpochMilli();
@@ -408,17 +574,18 @@ public class LocalStorageProvider implements Storage {
             String dataToSign = bucketName + ":" + objectKey + ":" + expiryTime + ":" + method;
             String signature = hmacSha256(signingKey, dataToSign);
             
-            String url = baseUrl + bucketName + "/" + objectKey + 
+            String urlString = baseUrl + bucketName + "/" + objectKey + 
                         "?expiry=" + expiryTime + "&signature=" + signature;
             
             return new StorageUrl(
-                new URL(url),
+                new URL(urlString),
                 Instant.now().plusSeconds(expiryInSeconds),
                 Collections.emptyMap(),
                 method == HttpMethod.PUT ? StorageUrl.UrlType.UPLOAD : StorageUrl.UrlType.SIGNED
             );
         } catch (Exception e) {
-            throw new StorageException("Failed to generate signed URL", e);
+            throw new StorageException(StorageException.ErrorCode.URL_GENERATION_ERROR,
+                "Failed to generate signed URL", e);
         }
     }
     
@@ -430,10 +597,11 @@ public class LocalStorageProvider implements Storage {
                 baseUrl = "http://localhost:8080/files/";
             }
             
-            String url = baseUrl + bucketName + "/" + objectKey;
-            return new StorageUrl(new URL(url), null, Collections.emptyMap(), StorageUrl.UrlType.PUBLIC);
+            String urlString = baseUrl + bucketName + "/" + objectKey;
+            return new StorageUrl(new URL(urlString), null, Collections.emptyMap(), StorageUrl.UrlType.PUBLIC);
         } catch (Exception e) {
-            throw new StorageException("Failed to generate public URL", e);
+            throw new StorageException(StorageException.ErrorCode.URL_GENERATION_ERROR,
+                "Failed to generate public URL", e);
         }
     }
     
@@ -475,7 +643,8 @@ public class LocalStorageProvider implements Storage {
             
             return fileInfo;
         } catch (IOException e) {
-            throw new StorageException("Failed to get object info", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to get object info", e);
         }
     }
     
@@ -505,7 +674,8 @@ public class LocalStorageProvider implements Storage {
                 props.store(os, "File metadata");
             }
         } catch (IOException e) {
-            throw new StorageException("Failed to update metadata", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to update metadata", e);
         }
     }
     
@@ -518,7 +688,13 @@ public class LocalStorageProvider implements Storage {
     public List<FileInfo> listObjects(String bucketName, String prefix) throws StorageException {
         try {
             Path bucketPath = getBucketPath(bucketName);
-            Path searchPath = bucketPath.resolve(prefix);
+            Path searchPath = bucketPath.resolve(prefix).normalize();
+            
+            // Security check
+            if (!searchPath.startsWith(bucketPath)) {
+                throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                    "Invalid prefix", bucketName, null);
+            }
             
             List<FileInfo> objects = new ArrayList<>();
             
@@ -531,13 +707,14 @@ public class LocalStorageProvider implements Storage {
                             return FileVisitResult.CONTINUE;
                         }
                         
-                        String relativePath = bucketPath.relativize(file).toString();
-                        objects.add(new FileInfo(
+                        String relativePath = bucketPath.relativize(file).toString().replace('\\', '/');
+                        FileInfo fileInfo = new FileInfo(
                             bucketName,
                             relativePath,
                             attrs.size(),
                             attrs.lastModifiedTime().toInstant()
-                        ));
+                        );
+                        objects.add(fileInfo);
                         return FileVisitResult.CONTINUE;
                     }
                 });
@@ -545,7 +722,8 @@ public class LocalStorageProvider implements Storage {
             
             return objects;
         } catch (IOException e) {
-            throw new StorageException("Failed to list objects", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to list objects", e);
         }
     }
     
@@ -557,7 +735,11 @@ public class LocalStorageProvider implements Storage {
                                                        ProgressCallback progressCallback) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                return putObject(bucketName, objectKey, data, contentLength, contentType, metadata);
+                FileInfo result = putObject(bucketName, objectKey, data, contentLength, contentType, metadata);
+                if (progressCallback != null) {
+                    progressCallback.onProgress(contentLength, contentLength);
+                }
+                return result;
             } catch (StorageException e) {
                 throw new RuntimeException(e);
             }
@@ -596,7 +778,8 @@ public class LocalStorageProvider implements Storage {
             
             return getObjectInfo(destinationBucket, destinationKey);
         } catch (IOException e) {
-            throw new StorageException("Failed to copy object", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to copy object", e);
         }
     }
     
@@ -620,7 +803,8 @@ public class LocalStorageProvider implements Storage {
             
             return getObjectInfo(destinationBucket, destinationKey);
         } catch (IOException e) {
-            throw new StorageException("Failed to move object", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to move object", e);
         }
     }
     
@@ -643,6 +827,7 @@ public class LocalStorageProvider implements Storage {
         Map<String, String> fields = new HashMap<>();
         fields.put("key", objectKey);
         fields.put("bucket", bucketName);
+        fields.put("expires", String.valueOf(Instant.now().plusSeconds(expiryInSeconds).toEpochMilli()));
         
         if (conditions != null) {
             fields.putAll(conditions);
@@ -653,7 +838,20 @@ public class LocalStorageProvider implements Storage {
     
     @Override
     public void close() throws Exception {
-        // Nothing to close for local storage
+        running = false;
+        if (cleanupThread != null) {
+            cleanupThread.interrupt();
+        }
+        
+        // Clean up all active multipart uploads
+        for (String uploadId : new ArrayList<>(activeMultipartUploads.keySet())) {
+            try {
+                abortMultipartUpload(null, null, uploadId);
+            } catch (Exception e) {
+                // Log and continue
+                System.err.println("Failed to abort multipart upload during close: " + e.getMessage());
+            }
+        }
     }
     
     // Helper methods

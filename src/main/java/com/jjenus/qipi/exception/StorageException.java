@@ -1,4 +1,4 @@
-package com.jjenus.storage.core;
+package com.jjenus.qipi.exception;
 
 public class StorageException extends Exception {
     private final ErrorCode errorCode;
@@ -17,7 +17,8 @@ public class StorageException extends Exception {
         URL_GENERATION_ERROR,
         NETWORK_ERROR,
         SERVER_ERROR,
-        VALIDATION_ERROR
+        VALIDATION_ERROR,
+        PROVIDER_ERROR
     }
     
     public StorageException(String message) {
@@ -46,6 +47,13 @@ public class StorageException extends Exception {
         this.errorCode = errorCode;
         this.bucketName = bucketName;
         this.objectKey = objectKey;
+    }
+    
+    public StorageException(ErrorCode errorCode, String message, Throwable cause) {
+        super(message, cause);
+        this.errorCode = errorCode;
+        this.bucketName = null;
+        this.objectKey = null;
     }
     
     public ErrorCode getErrorCode() { return errorCode; }

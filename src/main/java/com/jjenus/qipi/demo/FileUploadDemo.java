@@ -1,6 +1,8 @@
+package com.jjenus.qipi.demo;
+
 import com.jjenus.qipi.StorageFactory;
+import com.jjenus.qipi.config.StorageConfig;
 import com.jjenus.qipi.core.Storage;
-import com.jjenus.qipi.core.StorageException;
 import com.jjenus.qipi.model.FileInfo;
 import com.jjenus.qipi.model.StorageUrl;
 import com.jjenus.qipi.model.UploadPartResult;
@@ -9,190 +11,207 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
 /**
  * Complete demo showing how to use the storage system for user uploads
  */
 public class FileUploadDemo {
-    
+
     private final Storage storage;
-    
+
     public FileUploadDemo(Storage storage) {
         this.storage = storage;
     }
-    
-    /**
-     * Upload a file and return URL for database storage
-     */
-    public UploadResult uploadUserFile(String userId, String fileName, 
+
+    public UploadResult uploadUserFile(String userId, String fileName,
                                        InputStream fileData, long fileSize,
                                        String contentType) throws Exception {
-        
-        // Create user-specific bucket/folder
+
         String bucketName = "user-" + userId;
         if (!storage.bucketExists(bucketName)) {
             storage.createBucket(bucketName);
+            System.out.println("Created bucket: " + bucketName);
         }
-        
-        // Generate unique file key to avoid collisions
+
         String fileKey = generateFileKey(userId, fileName);
-        
-        // Add user metadata
+
         Map<String, String> metadata = new HashMap<>();
         metadata.put("userId", userId);
         metadata.put("originalFileName", fileName);
         metadata.put("uploadTime", String.valueOf(System.currentTimeMillis()));
-        
-        // Upload file
+        metadata.put("contentType", contentType);
+
+        System.out.println("Uploading: " + fileKey + " (" + fileSize + " bytes)");
+
         FileInfo fileInfo = storage.putObject(
-            bucketName, fileKey, fileData, fileSize, contentType, metadata
+                bucketName, fileKey, fileData, fileSize, contentType, metadata
         );
-        
-        // Generate URLs for different purposes
-        StorageUrl publicUrl = storage.generatePublicUrl(bucketName, fileKey);
-        StorageUrl signedUrl = storage.generateSignedUrl(
-            bucketName, fileKey, Storage.HttpMethod.GET, 3600 // 1 hour expiry
-        );
-        
+
+        System.out.println("Upload complete. ETag: " + fileInfo.getEtag());
+
+        StorageUrl publicUrl = null;
+        StorageUrl signedUrl = null;
+
+        try {
+            publicUrl = storage.generatePublicUrl(bucketName, fileKey);
+            signedUrl = storage.generateSignedUrl(
+                    bucketName, fileKey, Storage.HttpMethod.GET, 3600
+            );
+        } catch (Exception e) {
+            System.out.println("Note: URL generation not configured: " + e.getMessage());
+        }
+
         return new UploadResult(
-            fileInfo,
-            publicUrl,
-            signedUrl,
-            bucketName + "/" + fileKey  // Path to store in DB
+                fileInfo,
+                publicUrl,
+                signedUrl,
+                bucketName + "/" + fileKey
         );
     }
-    
-    /**
-     * Handle large file upload with multipart
-     */
+
     public UploadResult uploadLargeFile(String userId, String fileName,
                                         Path filePath, String contentType) throws Exception {
-        
+
+        System.out.println("\nHandling large file upload...");
+
         String bucketName = "user-" + userId;
         if (!storage.bucketExists(bucketName)) {
             storage.createBucket(bucketName);
         }
-        
+
         String fileKey = generateFileKey(userId, fileName);
         long fileSize = Files.size(filePath);
-        
-        // For files > 100MB, use multipart upload
-        if (fileSize > 100 * 1024 * 1024) {
+
+        System.out.println("File size: " + fileSize + " bytes");
+
+        if (fileSize > 5 * 1024 * 1024) {
+            System.out.println("Using multipart upload (file > 5MB)");
             return multipartUpload(bucketName, fileKey, filePath, contentType, userId);
         } else {
-            // Regular upload for smaller files
+            System.out.println("Using regular upload");
             try (InputStream is = Files.newInputStream(filePath)) {
                 Map<String, String> metadata = new HashMap<>();
                 metadata.put("userId", userId);
                 metadata.put("originalFileName", fileName);
-                
+
                 FileInfo fileInfo = storage.putObject(
-                    bucketName, fileKey, is, fileSize, contentType, metadata
+                        bucketName, fileKey, is, fileSize, contentType, metadata
                 );
-                
-                StorageUrl signedUrl = storage.generateSignedUrl(
-                    bucketName, fileKey, Storage.HttpMethod.GET, 3600
-                );
-                
+
+                StorageUrl signedUrl = null;
+                try {
+                    signedUrl = storage.generateSignedUrl(
+                            bucketName, fileKey, Storage.HttpMethod.GET, 3600
+                    );
+                } catch (Exception ignored) {
+                }
+
                 return new UploadResult(
-                    fileInfo,
-                    null,
-                    signedUrl,
-                    bucketName + "/" + fileKey
+                        fileInfo,
+                        null,
+                        signedUrl,
+                        bucketName + "/" + fileKey
                 );
             }
         }
     }
-    
+
     private UploadResult multipartUpload(String bucketName, String fileKey,
                                          Path filePath, String contentType,
                                          String userId) throws Exception {
-        
-        // Initialize multipart upload
+
         Map<String, String> metadata = new HashMap<>();
         metadata.put("userId", userId);
-        
+        metadata.put("uploadMethod", "multipart");
+
+        System.out.println("Initiating multipart upload...");
         String uploadId = storage.initiateMultipartUpload(
-            bucketName, fileKey, contentType, metadata
+                bucketName, fileKey, contentType, metadata
         );
-        
-        // Upload parts (5MB each)
-        long partSize = 5 * 1024 * 1024; // 5MB
+        System.out.println("Upload ID: " + uploadId);
+
+        long partSize = 5 * 1024 * 1024;
         long fileSize = Files.size(filePath);
         int partCount = (int) Math.ceil((double) fileSize / partSize);
-        
+
         List<UploadPartResult> parts = new ArrayList<>();
-        
+
+        System.out.println("Uploading " + partCount + " parts...");
+
         try (RandomAccessFile raf = new RandomAccessFile(filePath.toFile(), "r")) {
             for (int partNumber = 1; partNumber <= partCount; partNumber++) {
                 long startPos = (partNumber - 1) * partSize;
                 long size = Math.min(partSize, fileSize - startPos);
-                
-                // Read part data
-                byte[] partData = new byte[(int)size];
+
+                byte[] partData = new byte[(int) size];
                 raf.seek(startPos);
                 raf.readFully(partData);
-                
-                // Upload part
+
                 try (ByteArrayInputStream bais = new ByteArrayInputStream(partData)) {
                     UploadPartResult partResult = storage.uploadPart(
-                        bucketName, fileKey, uploadId, partNumber, bais, size
+                            bucketName, fileKey, uploadId, partNumber, bais, size
                     );
                     parts.add(partResult);
-                    
-                    System.out.println("Uploaded part " + partNumber + " of " + partCount);
+
+                    System.out.print("Part " + partNumber + "/" + partCount + " uploaded\r");
                 }
             }
         }
-        
-        // Complete multipart upload
+
+        System.out.println("\nAll parts uploaded. Completing multipart upload...");
+
         FileInfo fileInfo = storage.completeMultipartUpload(
-            bucketName, fileKey, uploadId, parts
+                bucketName, fileKey, uploadId, parts
         );
-        
-        StorageUrl signedUrl = storage.generateSignedUrl(
-            bucketName, fileKey, Storage.HttpMethod.GET, 3600
-        );
-        
+
+        System.out.println("Multipart upload complete. Final ETag: " + fileInfo.getEtag());
+
+        StorageUrl signedUrl = null;
+        try {
+            signedUrl = storage.generateSignedUrl(
+                    bucketName, fileKey, Storage.HttpMethod.GET, 3600
+            );
+        } catch (Exception ignored) {
+        }
+
         return new UploadResult(
-            fileInfo,
-            null,
-            signedUrl,
-            bucketName + "/" + fileKey
+                fileInfo,
+                null,
+                signedUrl,
+                bucketName + "/" + fileKey
         );
     }
-    
-    /**
-     * Download file for user
-     */
+
     public void downloadFile(String storagePath, OutputStream outputStream) throws Exception {
         String[] parts = storagePath.split("/", 2);
         String bucketName = parts[0];
         String fileKey = parts[1];
-        
+
+        System.out.println("Downloading: " + fileKey);
+
         try (InputStream is = storage.getObject(bucketName, fileKey)) {
             byte[] buffer = new byte[8192];
             int bytesRead;
+            long totalBytes = 0;
+
             while ((bytesRead = is.read(buffer)) != -1) {
                 outputStream.write(buffer, 0, bytesRead);
+                totalBytes += bytesRead;
             }
+
+            System.out.println("Downloaded " + totalBytes + " bytes");
         }
     }
-    
-    /**
-     * Stream video file (supports range requests)
-     */
-    public void streamVideo(String storagePath, long start, long end, 
+
+    public void streamVideo(String storagePath, long start, long end,
                             OutputStream outputStream) throws Exception {
         String[] parts = storagePath.split("/", 2);
         String bucketName = parts[0];
         String fileKey = parts[1];
-        
+
+        System.out.println("Streaming range " + start + "-" + end + " from: " + fileKey);
+
         try (InputStream is = storage.getObjectRange(bucketName, fileKey, start, end)) {
             byte[] buffer = new byte[8192];
             int bytesRead;
@@ -201,38 +220,29 @@ public class FileUploadDemo {
             }
         }
     }
-    
-    /**
-     * Generate temporary access URL for sharing
-     */
+
     public String generateShareLink(String storagePath, long expirySeconds) throws Exception {
         String[] parts = storagePath.split("/", 2);
         String bucketName = parts[0];
         String fileKey = parts[1];
-        
+
         StorageUrl signedUrl = storage.generateSignedUrl(
-            bucketName, fileKey, Storage.HttpMethod.GET, expirySeconds
+                bucketName, fileKey, Storage.HttpMethod.GET, expirySeconds
         );
-        
+
         return signedUrl.getUrl().toString();
     }
-    
-    /**
-     * Generate direct upload URL (for browser uploads)
-     */
+
     public StorageUrl generateDirectUploadUrl(String userId, String fileName,
                                               String contentType) throws Exception {
         String bucketName = "user-" + userId;
         String fileKey = generateFileKey(userId, fileName);
-        
+
         return storage.generateUploadUrl(
-            bucketName, fileKey, contentType, 3600 // 1 hour to upload
+                bucketName, fileKey, contentType, 3600
         );
     }
-    
-    /**
-     * List user's files
-     */
+
     public List<FileInfo> listUserFiles(String userId) throws Exception {
         String bucketName = "user-" + userId;
         if (storage.bucketExists(bucketName)) {
@@ -240,102 +250,92 @@ public class FileUploadDemo {
         }
         return new ArrayList<>();
     }
-    
-    /**
-     * Delete user file
-     */
+
     public void deleteFile(String storagePath) throws Exception {
         String[] parts = storagePath.split("/", 2);
         String bucketName = parts[0];
         String fileKey = parts[1];
-        
+
         storage.deleteObject(bucketName, fileKey);
+        System.out.println("Deleted: " + fileKey);
+
+        if (storage.listObjects(bucketName).isEmpty()) {
+            storage.deleteBucket(bucketName);
+            System.out.println("Deleted empty bucket: " + bucketName);
+        }
     }
-    
+
     private String generateFileKey(String userId, String fileName) {
         String timestamp = String.valueOf(System.currentTimeMillis());
         String uniqueId = UUID.randomUUID().toString().substring(0, 8);
         return userId + "/" + timestamp + "-" + uniqueId + "-" + fileName;
     }
-    
-    /**
-     * Result of upload operation
-     */
+
     public static class UploadResult {
         private final FileInfo fileInfo;
         private final StorageUrl publicUrl;
         private final StorageUrl signedUrl;
         private final String storagePath;
-        
-        public UploadResult(FileInfo fileInfo, StorageUrl publicUrl, 
-                           StorageUrl signedUrl, String storagePath) {
+
+        public UploadResult(FileInfo fileInfo, StorageUrl publicUrl,
+                            StorageUrl signedUrl, String storagePath) {
             this.fileInfo = fileInfo;
             this.publicUrl = publicUrl;
             this.signedUrl = signedUrl;
             this.storagePath = storagePath;
         }
-        
+
         public FileInfo getFileInfo() { return fileInfo; }
         public StorageUrl getPublicUrl() { return publicUrl; }
         public StorageUrl getSignedUrl() { return signedUrl; }
         public String getStoragePath() { return storagePath; }
-        
-        // This is what you'd store in your database
-        public String getDbValue() {
-            return storagePath;
-        }
+        public String getDbValue() { return storagePath; }
     }
-    
+
     public static void main(String[] args) {
+        System.out.println("\n" + "=".repeat(60));
+        System.out.println("QIPI STORAGE DEMO");
+        System.out.println("=".repeat(60));
+
+        Storage storage = null;
+
         try {
-            // Choose your storage provider by changing this properties file
-            Storage storage = StorageFactory.createStorageFromProperties("storage-local.properties");
-            
-            // Or use MinIO for local S3-compatible storage
-            // Storage storage = StorageFactory.createStorageFromProperties("storage-minio.properties");
-            
-            // Or use AWS S3
-            // Storage storage = StorageFactory.createStorageFromProperties("storage-s3.properties");
-            
-            FileUploadDemo demo = new FileUploadDemo(storage);
-            
-            // Simulate user upload
-            String userId = "user123";
-            String fileName = "profile-photo.jpg";
-            String contentType = "image/jpeg";
-            
-            // Create a dummy file for demo
-            byte[] dummyContent = "This is a test file content".getBytes();
-            
-            try (ByteArrayInputStream bais = new ByteArrayInputStream(dummyContent)) {
-                UploadResult result = demo.uploadUserFile(
-                    userId, fileName, bais, dummyContent.length, contentType
-                );
-                
-                System.out.println("File uploaded successfully!");
-                System.out.println("Store this in DB: " + result.getDbValue());
-                System.out.println("Access URL (valid for 1 hour): " + result.getSignedUrl());
-                
-                // Later, when user wants to download:
-                String storedPath = result.getDbValue();
-                
-                // Generate share link
-                String shareLink = demo.generateShareLink(storedPath, 3600);
-                System.out.println("Share link: " + shareLink);
-                
-                // List user's files
-                List<FileInfo> files = demo.listUserFiles(userId);
-                System.out.println("User has " + files.size() + " files");
-                
-                // Clean up
-                demo.deleteFile(storedPath);
-                System.out.println("File deleted");
+            String configFile = args.length > 0 ? args[0] : "storage-local.properties";
+            System.out.println("\nUsing config: " + configFile);
+
+            try {
+                storage = StorageFactory.createStorageFromProperties(configFile);
+                System.out.println("Storage initialized");
+            } catch (Exception e) {
+                System.out.println("Could not load properties file, using default local config");
+
+                StorageConfig config = new StorageConfig.Builder()
+                        .provider(StorageConfig.ProviderType.LOCAL)
+                        .basePath("./qipi-demo-data")
+                        .baseUrl("file://" + Paths.get("./qipi-demo-data").toAbsolutePath() + "/")
+                        .signingKey("demo-signing-key-2024")
+                        .build();
+
+                storage = StorageFactory.createStorage(config);
+                System.out.println("Storage initialized with default config");
             }
-            
-            storage.close();
-            
+
+            FileUploadDemo demo = new FileUploadDemo(storage);
+            String userId = "demo-user-" + System.currentTimeMillis() % 10000;
+            System.out.println("\nDemo user: " + userId);
+
         } catch (Exception e) {
+            System.err.println("\nDEMO FAILED: " + e.getMessage());
             e.printStackTrace();
+        } finally {
+            if (storage != null) {
+                try {
+                    storage.close();
+                    System.out.println("\nStorage connection closed");
+                } catch (Exception e) {
+                    System.err.println("Error closing storage: " + e.getMessage());
+                }
+            }
         }
     }
 }

@@ -3,16 +3,19 @@ package com.jjenus.qipi;
 import com.jjenus.qipi.config.StorageConfig;
 import com.jjenus.qipi.core.Storage;
 import com.jjenus.qipi.providers.LocalStorageProvider;
-import com.jjenus.qipi.providers.S3StorageProvider;
+//import com.jjenus.qipi.providers.S3StorageProvider;
+
+import java.io.InputStream;
 
 public class StorageFactory {
     
     public static Storage createStorage(StorageConfig config) throws Exception {
         switch (config.getProviderType()) {
             case LOCAL:
+                return new LocalStorageProvider(config);
             case MINIO:  // MinIO uses S3 provider with path style access
             case AWS_S3:
-                return new S3StorageProvider(config);
+                // return new S3StorageProvider(config);
             default:
                 throw new IllegalArgumentException(
                     "Unsupported provider type: " + config.getProviderType()
@@ -36,6 +39,7 @@ public class StorageFactory {
             .provider(StorageConfig.ProviderType.LOCAL)
             .basePath(basePath)
             .baseUrl("http://localhost:8080/files/")
+            .signingKey("local-signing-key-change-this")
             .build();
         return createStorage(config);
     }

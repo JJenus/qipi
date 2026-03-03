@@ -1,7 +1,6 @@
 package com.jjenus.qipi.config;
 
 import java.io.InputStream;
-import java.net.URL;
 import java.util.Properties;
 
 public class StorageConfig {
@@ -10,35 +9,34 @@ public class StorageConfig {
         LOCAL,          // Local filesystem
         AWS_S3,         // Amazon S3
         MINIO,          // MinIO (S3-compatible)
-        GCS,            // Google Cloud Storage
-        AZURE_BLOB      // Azure Blob Storage
+        GCS,            // Google Cloud Storage (future)
+        AZURE_BLOB      // Azure Blob Storage (future)
     }
     
-    private ProviderType providerType;
-    private String basePath;                // For local storage
-    private String endpoint;                 // For custom endpoints (MinIO, etc.)
-    private String region;                    // AWS region
-    private String accessKey;
-    private String secretKey;
-    private String sessionToken;
-    private boolean pathStyleAccess;          // For MinIO compatibility
-    private boolean useHttps = true;
-    private int connectionTimeout = 30000;    // milliseconds
-    private int socketTimeout = 60000;         // milliseconds
-    private int maxConnections = 50;
-    private String bucketPrefix;               // Optional prefix for all buckets
-    private String baseUrl;                     // For public URL generation
-    private String signingKey;                   // For local URL signing
-    
-    // Multipart upload settings
-    private long multipartMinPartSize = 5 * 1024 * 1024;      // 5MB
-    private long multipartMaxPartSize = 5 * 1024 * 1024 * 1024; // 5GB
-    private int multipartMaxParts = 10000;
-    
-    // URL settings
-    private long defaultUrlExpirySeconds = 3600; // 1 hour
+    private final ProviderType providerType;
+    private final String basePath;
+    private final String endpoint;
+    private final String region;
+    private final String accessKey;
+    private final String secretKey;
+    private final String sessionToken;
+    private final boolean pathStyleAccess;
+    private final boolean useHttps;
+    private final int connectionTimeout;
+    private final int socketTimeout;
+    private final int maxConnections;
+    private final String bucketPrefix;
+    private final String baseUrl;
+    private final String signingKey;
+    private final long multipartMinPartSize;
+    private final long multipartMaxPartSize;
+    private final int multipartMaxParts;
+    private final long defaultUrlExpirySeconds;
     
     private StorageConfig(Builder builder) {
+        // Validate based on provider type
+        validateConfig(builder);
+        
         this.providerType = builder.providerType;
         this.basePath = builder.basePath;
         this.endpoint = builder.endpoint;
@@ -60,6 +58,32 @@ public class StorageConfig {
         this.defaultUrlExpirySeconds = builder.defaultUrlExpirySeconds;
     }
     
+    private void validateConfig(Builder builder) {
+        switch (builder.providerType) {
+            case LOCAL:
+                if (builder.basePath == null || builder.basePath.trim().isEmpty()) {
+                    throw new IllegalArgumentException("basePath is required for LOCAL storage");
+                }
+                break;
+            case AWS_S3:
+                if (builder.region == null || builder.region.trim().isEmpty()) {
+                    throw new IllegalArgumentException("region is required for AWS_S3 storage");
+                }
+                if (builder.accessKey == null || builder.secretKey == null) {
+                    throw new IllegalArgumentException("accessKey and secretKey are required for AWS_S3 storage");
+                }
+                break;
+            case MINIO:
+                if (builder.endpoint == null || builder.endpoint.trim().isEmpty()) {
+                    throw new IllegalArgumentException("endpoint is required for MINIO storage");
+                }
+                if (builder.accessKey == null || builder.secretKey == null) {
+                    throw new IllegalArgumentException("accessKey and secretKey are required for MINIO storage");
+                }
+                break;
+        }
+    }
+    
     public static class Builder {
         private ProviderType providerType = ProviderType.LOCAL;
         private String basePath = "./storage";
@@ -76,8 +100,8 @@ public class StorageConfig {
         private String bucketPrefix;
         private String baseUrl;
         private String signingKey;
-        private long multipartMinPartSize = 5 * 1024 * 1024;
-        private long multipartMaxPartSize = 5L * 1024 * 1024 * 1024;
+        private long multipartMinPartSize = 5 * 1024 * 1024;      // 5MB
+        private long multipartMaxPartSize = 5L * 1024 * 1024 * 1024; // 5GB
         private int multipartMaxParts = 10000;
         private long defaultUrlExpirySeconds = 3600;
         
@@ -174,7 +198,11 @@ public class StorageConfig {
         Builder builder = new Builder();
         
         String provider = props.getProperty("storage.provider", "LOCAL");
-        builder.provider(ProviderType.valueOf(provider.toUpperCase()));
+        try {
+            builder.provider(ProviderType.valueOf(provider.toUpperCase()));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid provider type: " + provider);
+        }
         
         if (props.containsKey("storage.basePath")) {
             builder.basePath(props.getProperty("storage.basePath"));
@@ -200,12 +228,20 @@ public class StorageConfig {
             builder.pathStyleAccess(Boolean.parseBoolean(props.getProperty("storage.pathStyleAccess")));
         }
         
+        if (props.containsKey("storage.useHttps")) {
+            builder.useHttps(Boolean.parseBoolean(props.getProperty("storage.useHttps")));
+        }
+        
         if (props.containsKey("storage.baseUrl")) {
             builder.baseUrl(props.getProperty("storage.baseUrl"));
         }
         
         if (props.containsKey("storage.signingKey")) {
             builder.signingKey(props.getProperty("storage.signingKey"));
+        }
+        
+        if (props.containsKey("storage.bucketPrefix")) {
+            builder.bucketPrefix(props.getProperty("storage.bucketPrefix"));
         }
         
         return builder.build();
