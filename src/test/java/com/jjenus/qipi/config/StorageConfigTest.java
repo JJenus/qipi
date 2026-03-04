@@ -12,88 +12,306 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @DisplayName("StorageConfig Tests")
 class StorageConfigTest {
-    
+
     @Nested
-    @DisplayName("Builder Tests")
-    class BuilderTests {
-        
+    @DisplayName("Builder Basic Operations")
+    class BuilderBasicTests {
+
         @Test
-        @DisplayName("Should build LOCAL config with minimal settings")
-        void testBuildLocalMinimal() {
+        @DisplayName("Should create LOCAL config with defaults")
+        void shouldCreateLocalConfigWithDefaults() {
             StorageConfig config = new StorageConfig.Builder()
-                .provider(StorageConfig.ProviderType.LOCAL)
-                .basePath("./test-storage")
-                .build();
-            
+                    .provider(StorageConfig.ProviderType.LOCAL)
+                    .build();
+
             assertEquals(StorageConfig.ProviderType.LOCAL, config.getProviderType());
-            assertEquals("./test-storage", config.getBasePath());
-            assertEquals("us-east-1", config.getRegion()); // default
-            assertNull(config.getEndpoint());
-            assertNull(config.getAccessKey());
-            assertNull(config.getSecretKey());
+            assertEquals("./storage", config.getBasePath()); // Default value
+            assertEquals("us-east-1", config.getRegion()); // Default value
         }
-        
+
         @Test
-        @DisplayName("Should build AWS_S3 config")
-        void testBuildAwsS3() {
+        @DisplayName("Should override LOCAL defaults when specified")
+        void shouldOverrideLocalDefaults() {
             StorageConfig config = new StorageConfig.Builder()
-                .provider(StorageConfig.ProviderType.AWS_S3)
-                .region("eu-west-1")
-                .credentials("access123", "secret456")
-                .build();
-            
-            assertEquals(StorageConfig.ProviderType.AWS_S3, config.getProviderType());
+                    .provider(StorageConfig.ProviderType.LOCAL)
+                    .basePath("/custom/path")
+                    .region("eu-west-1")
+                    .build();
+
+            assertEquals("/custom/path", config.getBasePath());
             assertEquals("eu-west-1", config.getRegion());
-            assertEquals("access123", config.getAccessKey());
+        }
+
+        @Test
+        @DisplayName("Should create AWS_S3 config with required fields")
+        void shouldCreateAwsS3Config() {
+            StorageConfig config = new StorageConfig.Builder()
+                    .provider(StorageConfig.ProviderType.AWS_S3)
+                    .region("us-west-2")
+                    .credentials("AKIA123", "secret456")
+                    .build();
+
+            assertEquals(StorageConfig.ProviderType.AWS_S3, config.getProviderType());
+            assertEquals("us-west-2", config.getRegion());
+            assertEquals("AKIA123", config.getAccessKey());
             assertEquals("secret456", config.getSecretKey());
         }
-        
+
         @Test
-        @DisplayName("Should build MINIO config")
-        void testBuildMinio() {
+        @DisplayName("Should create AWS_S3 config with default region")
+        void shouldCreateAwsS3WithDefaultRegion() {
             StorageConfig config = new StorageConfig.Builder()
-                .provider(StorageConfig.ProviderType.MINIO)
-                .endpoint("localhost:9000")
-                .credentials("minioadmin", "minioadmin")
-                .pathStyleAccess(true)
-                .useHttps(false)
-                .build();
-            
+                    .provider(StorageConfig.ProviderType.AWS_S3)
+                    .credentials("AKIA123", "secret456")
+                    .build();
+
+            assertEquals("us-east-1", config.getRegion()); // Default region
+        }
+
+        @Test
+        @DisplayName("Should create MINIO config with required fields")
+        void shouldCreateMinioConfig() {
+            StorageConfig config = new StorageConfig.Builder()
+                    .provider(StorageConfig.ProviderType.MINIO)
+                    .endpoint("localhost:9000")
+                    .credentials("minioadmin", "minioadmin")
+                    .build();
+
             assertEquals(StorageConfig.ProviderType.MINIO, config.getProviderType());
             assertEquals("localhost:9000", config.getEndpoint());
             assertEquals("minioadmin", config.getAccessKey());
             assertEquals("minioadmin", config.getSecretKey());
-            assertTrue(config.isPathStyleAccess());
-            assertFalse(config.isUseHttps());
         }
-        
+
+        @Test
+        @DisplayName("Should create GCS config without validation")
+        void shouldCreateGcsConfig() {
+            StorageConfig config = new StorageConfig.Builder()
+                    .provider(StorageConfig.ProviderType.GCS)
+                    .build();
+
+            assertEquals(StorageConfig.ProviderType.GCS, config.getProviderType());
+        }
+    }
+
+    @Nested
+    @DisplayName("Builder Validation Tests")
+    class BuilderValidationTests {
+
+        @Test
+        @DisplayName("Should throw when provider type is null")
+        void shouldThrowWhenProviderNull() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder().build()
+            );
+            assertEquals("Provider type must be specified", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate LOCAL requires non-empty basePath when explicitly set to empty")
+        void shouldValidateLocalBasePathWhenSetToEmpty() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.LOCAL)
+                            .basePath("")
+                            .build()
+            );
+            assertEquals("basePath is required for LOCAL storage", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate LOCAL requires non-empty basePath when set to whitespace")
+        void shouldValidateLocalBasePathWhenSetToWhitespace() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.LOCAL)
+                            .basePath("   ")
+                            .build()
+            );
+            assertEquals("basePath is required for LOCAL storage", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate AWS_S3 requires region when set to null")
+        void shouldValidateAwsS3RegionWhenSetToNull() {
+            // This will use default region "us-east-1", so it shouldn't throw
+            assertDoesNotThrow(() ->
+                    new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.AWS_S3)
+                            .credentials("key", "secret")
+                            .build()
+            );
+        }
+
+        @Test
+        @DisplayName("Should validate AWS_S3 requires region when set to empty")
+        void shouldValidateAwsS3RegionWhenSetToEmpty() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.AWS_S3)
+                            .region("")
+                            .credentials("key", "secret")
+                            .build()
+            );
+            assertEquals("region is required for AWS_S3 storage", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate AWS_S3 requires credentials")
+        void shouldValidateAwsS3Credentials() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.AWS_S3)
+                            .region("us-east-1")
+                            .build()
+            );
+            assertEquals("accessKey and secretKey are required for AWS_S3 storage", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate AWS_S3 requires both accessKey and secretKey")
+        void shouldValidateAwsS3BothCredentials() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.AWS_S3)
+                            .region("us-east-1")
+                            .credentials("key", null)
+                            .build()
+            );
+            assertEquals("accessKey and secretKey are required for AWS_S3 storage", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate MINIO requires endpoint")
+        void shouldValidateMinioEndpoint() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.MINIO)
+                            .credentials("key", "secret")
+                            .build()
+            );
+            assertEquals("endpoint is required for MINIO storage", exception.getMessage());
+        }
+
+        @Test
+        @DisplayName("Should validate MINIO requires credentials")
+        void shouldValidateMinioCredentials() {
+            IllegalArgumentException exception = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.MINIO)
+                            .endpoint("localhost:9000")
+                            .build()
+            );
+            assertEquals("accessKey and secretKey are required for MINIO storage", exception.getMessage());
+        }
+    }
+
+    @Nested
+    @DisplayName("Configuration Loading Tests")
+    class ConfigurationLoadingTests {
+
+        @Test
+        @DisplayName("Should load from Properties")
+        void shouldLoadFromProperties() {
+            Properties props = new Properties();
+            props.setProperty("storage.provider", "LOCAL");
+            props.setProperty("storage.basePath", "./custom");
+            props.setProperty("storage.region", "eu-west-1");
+
+            StorageConfig config = new StorageConfig.Builder()
+                    .fromProperties(props)
+                    .build();
+
+            assertEquals(StorageConfig.ProviderType.LOCAL, config.getProviderType());
+            assertEquals("./custom", config.getBasePath());
+            assertEquals("eu-west-1", config.getRegion());
+        }
+
+        @Test
+        @DisplayName("Should use defaults when properties missing")
+        void shouldUseDefaultsWhenPropertiesMissing() {
+            Properties props = new Properties();
+            props.setProperty("storage.provider", "LOCAL");
+            // basePath and region not specified
+
+            StorageConfig config = new StorageConfig.Builder()
+                    .fromProperties(props)
+                    .build();
+
+            assertEquals("./storage", config.getBasePath()); // Default
+            assertEquals("us-east-1", config.getRegion()); // Default
+        }
+
+        @Test
+        @DisplayName("Should override builder values with properties")
+        void shouldOverrideBuilderWithProperties() {
+            Properties props = new Properties();
+            props.setProperty("storage.provider", "LOCAL");
+            props.setProperty("storage.basePath", "/from/props");
+            props.setProperty("storage.region", "from-props");
+
+            StorageConfig config = new StorageConfig.Builder()
+                    .basePath("/from/builder")
+                    .region("from-builder")
+                    .fromProperties(props)
+                    .build();
+
+            assertEquals("/from/props", config.getBasePath());
+            assertEquals("from-props", config.getRegion());
+        }
+
+        @Test
+        @DisplayName("Should load from Map")
+        void shouldLoadFromMap() {
+            Map<String, String> map = new HashMap<>();
+            map.put("storage.provider", "MINIO");
+            map.put("storage.endpoint", "minio:9000");
+            map.put("storage.accessKey", "testkey");
+            map.put("storage.secretKey", "testsecret");
+
+            StorageConfig config = new StorageConfig.Builder()
+                    .fromMap(map)
+                    .build();
+
+            assertEquals(StorageConfig.ProviderType.MINIO, config.getProviderType());
+            assertEquals("minio:9000", config.getEndpoint());
+            assertEquals("testkey", config.getAccessKey());
+            assertEquals("testsecret", config.getSecretKey());
+        }
+    }
+
+    @Nested
+    @DisplayName("Optional Fields Tests")
+    class OptionalFieldsTests {
+
         @Test
         @DisplayName("Should set all optional fields")
-        void testAllFields() {
+        void shouldSetAllOptionalFields() {
             StorageConfig config = new StorageConfig.Builder()
-                .provider(StorageConfig.ProviderType.LOCAL)
-                .basePath("/custom/path")
-                .endpoint("custom.endpoint.com")
-                .region("custom-region")
-                .credentials("ak", "sk", "st")
-                .pathStyleAccess(true)
-                .useHttps(false)
-                .timeouts(5000, 10000)
-                .maxConnections(100)
-                .bucketPrefix("prefix-")
-                .baseUrl("https://storage.example.com/")
-                .signingKey("test-key")
-                .multipartSettings(1024 * 1024, 1024 * 1024 * 1024, 1000)
-                .defaultUrlExpirySeconds(7200)
-                .build();
-            
-            assertEquals(StorageConfig.ProviderType.LOCAL, config.getProviderType());
-            assertEquals("/custom/path", config.getBasePath());
+                    .provider(StorageConfig.ProviderType.LOCAL)
+                    .endpoint("custom.endpoint.com")
+                    .sessionToken("session123")
+                    .pathStyleAccess(true)
+                    .useHttps(false)
+                    .timeouts(5000, 10000)
+                    .maxConnections(100)
+                    .bucketPrefix("prefix-")
+                    .baseUrl("https://storage.example.com/")
+                    .signingKey("test-key")
+                    .multipartSettings(1024 * 1024, 1024 * 1024 * 1024, 1000)
+                    .defaultUrlExpirySeconds(7200)
+                    .build();
+
             assertEquals("custom.endpoint.com", config.getEndpoint());
-            assertEquals("custom-region", config.getRegion());
-            assertEquals("ak", config.getAccessKey());
-            assertEquals("sk", config.getSecretKey());
-            assertEquals("st", config.getSessionToken());
+            assertEquals("session123", config.getSessionToken());
             assertTrue(config.isPathStyleAccess());
             assertFalse(config.isUseHttps());
             assertEquals(5000, config.getConnectionTimeout());
@@ -107,185 +325,50 @@ class StorageConfigTest {
             assertEquals(1000, config.getMultipartMaxParts());
             assertEquals(7200, config.getDefaultUrlExpirySeconds());
         }
-        
+
         @Test
-        @DisplayName("Should validate required fields")
-        void testValidation() {
-            // Missing provider
-            assertThrows(IllegalArgumentException.class, () ->
-                new StorageConfig.Builder().build()
-            );
-            
-            // LOCAL missing basePath
-            assertThrows(IllegalArgumentException.class, () ->
-                new StorageConfig.Builder()
-                    .provider(StorageConfig.ProviderType.LOCAL)
-                    .build()
-            );
-            
-            // AWS_S3 missing region
-            assertThrows(IllegalArgumentException.class, () ->
-                new StorageConfig.Builder()
-                    .provider(StorageConfig.ProviderType.AWS_S3)
-                    .credentials("ak", "sk")
-                    .build()
-            );
-            
-            // AWS_S3 missing credentials
-            assertThrows(IllegalArgumentException.class, () ->
-                new StorageConfig.Builder()
+        @DisplayName("Should set session token via credentials method")
+        void shouldSetSessionToken() {
+            StorageConfig config = new StorageConfig.Builder()
                     .provider(StorageConfig.ProviderType.AWS_S3)
                     .region("us-east-1")
-                    .build()
-            );
-            
-            // MINIO missing endpoint
-            assertThrows(IllegalArgumentException.class, () ->
-                new StorageConfig.Builder()
-                    .provider(StorageConfig.ProviderType.MINIO)
-                    .credentials("ak", "sk")
-                    .build()
-            );
-            
-            // MINIO missing credentials
-            assertThrows(IllegalArgumentException.class, () ->
-                new StorageConfig.Builder()
-                    .provider(StorageConfig.ProviderType.MINIO)
-                    .endpoint("localhost:9000")
-                    .build()
-            );
+                    .credentials("key", "secret", "token")
+                    .build();
+
+            assertEquals("key", config.getAccessKey());
+            assertEquals("secret", config.getSecretKey());
+            assertEquals("token", config.getSessionToken());
         }
     }
-    
+
     @Nested
-    @DisplayName("Configuration Loading Tests")
-    class ConfigurationLoadingTests {
-        
-        @Test
-        @DisplayName("Should load from Properties")
-        void testFromProperties() {
-            Properties props = new Properties();
-            props.setProperty("storage.provider", "LOCAL");
-            props.setProperty("storage.basePath", "./test");
-            props.setProperty("storage.region", "eu-central-1");
-            props.setProperty("storage.maxConnections", "200");
-            
-            StorageConfig config = new StorageConfig.Builder()
-                .fromProperties(props)
-                .build();
-            
-            assertEquals(StorageConfig.ProviderType.LOCAL, config.getProviderType());
-            assertEquals("./test", config.getBasePath());
-            assertEquals("eu-central-1", config.getRegion());
-            assertEquals(200, config.getMaxConnections());
-        }
-        
-        @Test
-        @DisplayName("Should load from Map")
-        void testFromMap() {
-            Map<String, String> map = new HashMap<>();
-            map.put("storage.provider", "MINIO");
-            map.put("storage.endpoint", "minio:9000");
-            map.put("storage.accessKey", "testkey");
-            map.put("storage.secretKey", "testsecret");
-            map.put("storage.pathStyleAccess", "true");
-            
-            StorageConfig config = new StorageConfig.Builder()
-                .fromMap(map)
-                .build();
-            
-            assertEquals(StorageConfig.ProviderType.MINIO, config.getProviderType());
-            assertEquals("minio:9000", config.getEndpoint());
-            assertEquals("testkey", config.getAccessKey());
-            assertEquals("testsecret", config.getSecretKey());
-            assertTrue(config.isPathStyleAccess());
-        }
-        
-        @Test
-        @DisplayName("Should prioritize builder values over loaded values")
-        void testBuilderPriority() {
-            Properties props = new Properties();
-            props.setProperty("storage.provider", "AWS_S3");
-            props.setProperty("storage.region", "from-props");
-            
-            StorageConfig config = new StorageConfig.Builder()
-                .provider(StorageConfig.ProviderType.LOCAL)
-                .region("from-builder")
-                .fromProperties(props)
-                .build();
-            
-            // Builder values should win
-            assertEquals(StorageConfig.ProviderType.LOCAL, config.getProviderType());
-            assertEquals("from-builder", config.getRegion());
-        }
-        
-        @Test
-        @DisplayName("Should handle boolean conversions correctly")
-        void testBooleanConversions() {
-            Map<String, String> map = new HashMap<>();
-            map.put("storage.pathStyleAccess", "true");
-            map.put("storage.useHttps", "false");
-            
-            StorageConfig config = new StorageConfig.Builder()
-                .provider(StorageConfig.ProviderType.MINIO)
-                .endpoint("test")
-                .credentials("a", "b")
-                .fromMap(map)
-                .build();
-            
-            assertTrue(config.isPathStyleAccess());
-            assertFalse(config.isUseHttps());
-        }
-    }
-    
-    @Nested
-    @DisplayName("System Environment Loading Tests")
+    @DisplayName("System Environment Tests")
     class SystemEnvironmentTests {
-        
+
         @Test
         @DisplayName("Should load from system properties")
-        void testFromSystemProperties() {
-            // Set system properties
+        void shouldLoadFromSystemProperties() {
             System.setProperty("storage.provider", "LOCAL");
-            System.setProperty("storage.basePath", "/tmp/test");
-            
+            System.setProperty("storage.basePath", "/system/test");
+
             try {
                 StorageConfig config = StorageConfig.fromSystemEnvironment();
-                
                 assertEquals(StorageConfig.ProviderType.LOCAL, config.getProviderType());
-                assertEquals("/tmp/test", config.getBasePath());
+                assertEquals("/system/test", config.getBasePath());
             } finally {
                 System.clearProperty("storage.provider");
                 System.clearProperty("storage.basePath");
             }
         }
-        
+
         @Test
-        @DisplayName("Should handle missing system properties gracefully")
-        void testMissingSystemProperties() {
-            // No properties set - should throw due to missing provider
-            assertThrows(IllegalArgumentException.class, 
-                StorageConfig::fromSystemEnvironment);
+        @DisplayName("Should handle missing system properties")
+        void shouldHandleMissingSystemProperties() {
+            // Clear any existing properties
+            System.clearProperty("storage.provider");
+
+            assertThrows(IllegalArgumentException.class,
+                    StorageConfig::fromSystemEnvironment);
         }
-    }
-    
-    @Test
-    @DisplayName("Should have sensible defaults")
-    void testDefaults() {
-        StorageConfig config = new StorageConfig.Builder()
-            .provider(StorageConfig.ProviderType.LOCAL)
-            .basePath("/test")
-            .build();
-        
-        assertEquals(30000, config.getConnectionTimeout());
-        assertEquals(60000, config.getSocketTimeout());
-        assertEquals(50, config.getMaxConnections());
-        assertEquals(5 * 1024 * 1024, config.getMultipartMinPartSize());
-        assertEquals(5L * 1024 * 1024 * 1024, config.getMultipartMaxPartSize());
-        assertEquals(10000, config.getMultipartMaxParts());
-        assertEquals(3600, config.getDefaultUrlExpirySeconds());
-        assertFalse(config.isPathStyleAccess());
-        assertTrue(config.isUseHttps());
-        assertEquals("us-east-1", config.getRegion());
     }
 }

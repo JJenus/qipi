@@ -133,6 +133,11 @@ public final class StorageConfig {
             return this;
         }
 
+        public Builder sessionToken(String sessionToken) {
+            this.sessionToken = sessionToken;
+            return this;
+        }
+
         public Builder region(String region) {
             this.region = region;
             return this;

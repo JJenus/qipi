@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/bash
 
 echo "==================================="
 echo "  QIPI Storage Demo - Termux/Java 17"

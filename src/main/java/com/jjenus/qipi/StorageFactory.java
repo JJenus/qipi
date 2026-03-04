@@ -11,24 +11,14 @@ public final class StorageFactory {
     }
 
     public static Storage create(StorageConfig config) throws StorageException {
-        switch (config.getProviderType()) {
-
-            case LOCAL:
-                return new LocalStorageProvider(config);
-
-            case MINIO:
-            case AWS_S3:
-                throw new UnsupportedOperationException(
-                        "S3 provider not yet implemented");
-
-            case GCS:
-            case AZURE_BLOB:
-                throw new UnsupportedOperationException(
-                        "Provider not yet implemented: " + config.getProviderType());
-
-            default:
-                throw new IllegalArgumentException(
-                        "Unsupported provider type: " + config.getProviderType());
-        }
+        return switch (config.getProviderType()) {
+            case LOCAL -> new LocalStorageProvider(config);
+            case MINIO, AWS_S3 -> throw new UnsupportedOperationException(
+                    "S3 provider not yet implemented");
+            case GCS, AZURE_BLOB -> throw new UnsupportedOperationException(
+                    "Provider not yet implemented: " + config.getProviderType());
+            default -> throw new IllegalArgumentException(
+                    "Unsupported provider type: " + config.getProviderType());
+        };
     }
 }

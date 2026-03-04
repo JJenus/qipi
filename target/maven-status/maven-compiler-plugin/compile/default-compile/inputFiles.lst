@@ -1,0 +1,8 @@
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/model/UploadPartResult.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/core/Storage.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/exception/StorageException.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/model/StorageUrl.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/model/FileInfo.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/providers/LocalStorageProvider.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/StorageFactory.java
+/home/jjenus/workbench/apps/qipi/src/main/java/com/jjenus/qipi/config/StorageConfig.java
