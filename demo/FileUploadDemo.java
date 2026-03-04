@@ -15,6 +15,7 @@ import java.util.*;
 
 /**
  * Complete demo showing how to use the storage system for user uploads
+ * Fully compatible with StorageFactory.create(StorageConfig)
  */
 public class FileUploadDemo {
 
@@ -55,19 +56,12 @@ public class FileUploadDemo {
 
         try {
             publicUrl = storage.generatePublicUrl(bucketName, fileKey);
-            signedUrl = storage.generateSignedUrl(
-                    bucketName, fileKey, Storage.HttpMethod.GET, 3600
-            );
+            signedUrl = storage.generateSignedUrl(bucketName, fileKey, Storage.HttpMethod.GET, 3600);
         } catch (Exception e) {
             System.out.println("Note: URL generation not configured: " + e.getMessage());
         }
 
-        return new UploadResult(
-                fileInfo,
-                publicUrl,
-                signedUrl,
-                bucketName + "/" + fileKey
-        );
+        return new UploadResult(fileInfo, publicUrl, signedUrl, bucketName + "/" + fileKey);
     }
 
     public UploadResult uploadLargeFile(String userId, String fileName,
@@ -95,24 +89,15 @@ public class FileUploadDemo {
                 metadata.put("userId", userId);
                 metadata.put("originalFileName", fileName);
 
-                FileInfo fileInfo = storage.putObject(
-                        bucketName, fileKey, is, fileSize, contentType, metadata
-                );
+                FileInfo fileInfo = storage.putObject(bucketName, fileKey, is, fileSize, contentType, metadata);
 
                 StorageUrl signedUrl = null;
                 try {
-                    signedUrl = storage.generateSignedUrl(
-                            bucketName, fileKey, Storage.HttpMethod.GET, 3600
-                    );
+                    signedUrl = storage.generateSignedUrl(bucketName, fileKey, Storage.HttpMethod.GET, 3600);
                 } catch (Exception ignored) {
                 }
 
-                return new UploadResult(
-                        fileInfo,
-                        null,
-                        signedUrl,
-                        bucketName + "/" + fileKey
-                );
+                return new UploadResult(fileInfo, null, signedUrl, bucketName + "/" + fileKey);
             }
         }
     }
@@ -126,9 +111,7 @@ public class FileUploadDemo {
         metadata.put("uploadMethod", "multipart");
 
         System.out.println("Initiating multipart upload...");
-        String uploadId = storage.initiateMultipartUpload(
-                bucketName, fileKey, contentType, metadata
-        );
+        String uploadId = storage.initiateMultipartUpload(bucketName, fileKey, contentType, metadata);
         System.out.println("Upload ID: " + uploadId);
 
         long partSize = 5 * 1024 * 1024;
@@ -149,9 +132,7 @@ public class FileUploadDemo {
                 raf.readFully(partData);
 
                 try (ByteArrayInputStream bais = new ByteArrayInputStream(partData)) {
-                    UploadPartResult partResult = storage.uploadPart(
-                            bucketName, fileKey, uploadId, partNumber, bais, size
-                    );
+                    UploadPartResult partResult = storage.uploadPart(bucketName, fileKey, uploadId, partNumber, bais, size);
                     parts.add(partResult);
 
                     System.out.print("Part " + partNumber + "/" + partCount + " uploaded\r");
@@ -161,26 +142,17 @@ public class FileUploadDemo {
 
         System.out.println("\nAll parts uploaded. Completing multipart upload...");
 
-        FileInfo fileInfo = storage.completeMultipartUpload(
-                bucketName, fileKey, uploadId, parts
-        );
+        FileInfo fileInfo = storage.completeMultipartUpload(bucketName, fileKey, uploadId, parts);
 
         System.out.println("Multipart upload complete. Final ETag: " + fileInfo.getEtag());
 
         StorageUrl signedUrl = null;
         try {
-            signedUrl = storage.generateSignedUrl(
-                    bucketName, fileKey, Storage.HttpMethod.GET, 3600
-            );
+            signedUrl = storage.generateSignedUrl(bucketName, fileKey, Storage.HttpMethod.GET, 3600);
         } catch (Exception ignored) {
         }
 
-        return new UploadResult(
-                fileInfo,
-                null,
-                signedUrl,
-                bucketName + "/" + fileKey
-        );
+        return new UploadResult(fileInfo, null, signedUrl, bucketName + "/" + fileKey);
     }
 
     public void downloadFile(String storagePath, OutputStream outputStream) throws Exception {
@@ -201,67 +173,6 @@ public class FileUploadDemo {
             }
 
             System.out.println("Downloaded " + totalBytes + " bytes");
-        }
-    }
-
-    public void streamVideo(String storagePath, long start, long end,
-                            OutputStream outputStream) throws Exception {
-        String[] parts = storagePath.split("/", 2);
-        String bucketName = parts[0];
-        String fileKey = parts[1];
-
-        System.out.println("Streaming range " + start + "-" + end + " from: " + fileKey);
-
-        try (InputStream is = storage.getObjectRange(bucketName, fileKey, start, end)) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = is.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
-            }
-        }
-    }
-
-    public String generateShareLink(String storagePath, long expirySeconds) throws Exception {
-        String[] parts = storagePath.split("/", 2);
-        String bucketName = parts[0];
-        String fileKey = parts[1];
-
-        StorageUrl signedUrl = storage.generateSignedUrl(
-                bucketName, fileKey, Storage.HttpMethod.GET, expirySeconds
-        );
-
-        return signedUrl.getUrl().toString();
-    }
-
-    public StorageUrl generateDirectUploadUrl(String userId, String fileName,
-                                              String contentType) throws Exception {
-        String bucketName = "user-" + userId;
-        String fileKey = generateFileKey(userId, fileName);
-
-        return storage.generateUploadUrl(
-                bucketName, fileKey, contentType, 3600
-        );
-    }
-
-    public List<FileInfo> listUserFiles(String userId) throws Exception {
-        String bucketName = "user-" + userId;
-        if (storage.bucketExists(bucketName)) {
-            return storage.listObjects(bucketName);
-        }
-        return new ArrayList<>();
-    }
-
-    public void deleteFile(String storagePath) throws Exception {
-        String[] parts = storagePath.split("/", 2);
-        String bucketName = parts[0];
-        String fileKey = parts[1];
-
-        storage.deleteObject(bucketName, fileKey);
-        System.out.println("Deleted: " + fileKey);
-
-        if (storage.listObjects(bucketName).isEmpty()) {
-            storage.deleteBucket(bucketName);
-            System.out.println("Deleted empty bucket: " + bucketName);
         }
     }
 
@@ -300,25 +211,17 @@ public class FileUploadDemo {
         Storage storage = null;
 
         try {
-            String configFile = args.length > 0 ? args[0] : "storage-local.properties";
-            System.out.println("\nUsing config: " + configFile);
+            // Manual storage config, fully self-contained
+            storage = StorageFactory.create(
+                    new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.LOCAL)
+                            .basePath("./qipi-demo-data")
+                            .baseUrl("file://" + Paths.get("./qipi-demo-data").toAbsolutePath() + "/")
+                            .signingKey("demo-signing-key-2026")
+                            .build()
+            );
 
-            try {
-                storage = StorageFactory.createStorageFromProperties(configFile);
-                System.out.println("Storage initialized");
-            } catch (Exception e) {
-                System.out.println("Could not load properties file, using default local config");
-
-                StorageConfig config = new StorageConfig.Builder()
-                        .provider(StorageConfig.ProviderType.LOCAL)
-                        .basePath("./qipi-demo-data")
-                        .baseUrl("file://" + Paths.get("./qipi-demo-data").toAbsolutePath() + "/")
-                        .signingKey("demo-signing-key-2024")
-                        .build();
-
-                storage = StorageFactory.createStorage(config);
-                System.out.println("Storage initialized with default config");
-            }
+            System.out.println("Storage initialized");
 
             FileUploadDemo demo = new FileUploadDemo(storage);
             String userId = "demo-user-" + System.currentTimeMillis() % 10000;

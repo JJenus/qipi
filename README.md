@@ -1,4 +1,4 @@
-# qipi - Pluggable Object Storage
+# qipi - Pluggable Object Storage (update required)
 
 A flexible, S3-compatible storage system that works with local filesystem, MinIO, and AWS S3 using the same code.
 

@@ -1,18 +1,22 @@
 package com.jjenus.qipi.config;
 
-import java.io.InputStream;
+import java.util.Map;
 import java.util.Properties;
+import java.util.function.Function;
 
-public class StorageConfig {
-    
+/**
+ * Storage configuration.
+ *
+ * Note: Environment variable resolution (${ENV:default}) must be handled
+ * by the host application's configuration system before passing values here.
+ * This class does not perform environment discovery or file loading.
+ */
+public final class StorageConfig {
+
     public enum ProviderType {
-        LOCAL,          // Local filesystem
-        AWS_S3,         // Amazon S3
-        MINIO,          // MinIO (S3-compatible)
-        GCS,            // Google Cloud Storage (future)
-        AZURE_BLOB      // Azure Blob Storage (future)
+        LOCAL, AWS_S3, MINIO, GCS, AZURE_BLOB
     }
-    
+
     private final ProviderType providerType;
     private final String basePath;
     private final String endpoint;
@@ -32,11 +36,10 @@ public class StorageConfig {
     private final long multipartMaxPartSize;
     private final int multipartMaxParts;
     private final long defaultUrlExpirySeconds;
-    
+
     private StorageConfig(Builder builder) {
-        // Validate based on provider type
-        validateConfig(builder);
-        
+        validate(builder);
+
         this.providerType = builder.providerType;
         this.basePath = builder.basePath;
         this.endpoint = builder.endpoint;
@@ -57,35 +60,45 @@ public class StorageConfig {
         this.multipartMaxParts = builder.multipartMaxParts;
         this.defaultUrlExpirySeconds = builder.defaultUrlExpirySeconds;
     }
-    
-    private void validateConfig(Builder builder) {
-        switch (builder.providerType) {
+
+    private static void validate(Builder b) {
+        if (b.providerType == null) {
+            throw new IllegalArgumentException("Provider type must be specified");
+        }
+
+        switch (b.providerType) {
             case LOCAL:
-                if (builder.basePath == null || builder.basePath.trim().isEmpty()) {
+                if (b.basePath == null || b.basePath.trim().isEmpty()) {
                     throw new IllegalArgumentException("basePath is required for LOCAL storage");
                 }
                 break;
+
             case AWS_S3:
-                if (builder.region == null || builder.region.trim().isEmpty()) {
+                if (b.region == null || b.region.trim().isEmpty()) {
                     throw new IllegalArgumentException("region is required for AWS_S3 storage");
                 }
-                if (builder.accessKey == null || builder.secretKey == null) {
+                if (b.accessKey == null || b.secretKey == null) {
                     throw new IllegalArgumentException("accessKey and secretKey are required for AWS_S3 storage");
                 }
                 break;
+
             case MINIO:
-                if (builder.endpoint == null || builder.endpoint.trim().isEmpty()) {
+                if (b.endpoint == null || b.endpoint.trim().isEmpty()) {
                     throw new IllegalArgumentException("endpoint is required for MINIO storage");
                 }
-                if (builder.accessKey == null || builder.secretKey == null) {
+                if (b.accessKey == null || b.secretKey == null) {
                     throw new IllegalArgumentException("accessKey and secretKey are required for MINIO storage");
                 }
                 break;
+
+            default:
+                break;
         }
     }
-    
-    public static class Builder {
-        private ProviderType providerType = ProviderType.LOCAL;
+
+    public static final class Builder {
+
+        private ProviderType providerType;
         private String basePath = "./storage";
         private String endpoint;
         private String region = "us-east-1";
@@ -100,154 +113,193 @@ public class StorageConfig {
         private String bucketPrefix;
         private String baseUrl;
         private String signingKey;
-        private long multipartMinPartSize = 5 * 1024 * 1024;      // 5MB
-        private long multipartMaxPartSize = 5L * 1024 * 1024 * 1024; // 5GB
+        private long multipartMinPartSize = 5 * 1024 * 1024;
+        private long multipartMaxPartSize = 5L * 1024 * 1024 * 1024;
         private int multipartMaxParts = 10000;
         private long defaultUrlExpirySeconds = 3600;
-        
+
         public Builder provider(ProviderType type) {
             this.providerType = type;
             return this;
         }
-        
+
         public Builder basePath(String basePath) {
             this.basePath = basePath;
             return this;
         }
-        
+
         public Builder endpoint(String endpoint) {
             this.endpoint = endpoint;
             return this;
         }
-        
+
         public Builder region(String region) {
             this.region = region;
             return this;
         }
-        
+
         public Builder credentials(String accessKey, String secretKey) {
             this.accessKey = accessKey;
             this.secretKey = secretKey;
             return this;
         }
-        
+
         public Builder credentials(String accessKey, String secretKey, String sessionToken) {
             this.accessKey = accessKey;
             this.secretKey = secretKey;
             this.sessionToken = sessionToken;
             return this;
         }
-        
+
         public Builder pathStyleAccess(boolean pathStyleAccess) {
             this.pathStyleAccess = pathStyleAccess;
             return this;
         }
-        
+
         public Builder useHttps(boolean useHttps) {
             this.useHttps = useHttps;
             return this;
         }
-        
+
         public Builder timeouts(int connectionTimeout, int socketTimeout) {
             this.connectionTimeout = connectionTimeout;
             this.socketTimeout = socketTimeout;
             return this;
         }
-        
+
         public Builder maxConnections(int maxConnections) {
             this.maxConnections = maxConnections;
             return this;
         }
-        
+
         public Builder bucketPrefix(String bucketPrefix) {
             this.bucketPrefix = bucketPrefix;
             return this;
         }
-        
+
         public Builder baseUrl(String baseUrl) {
             this.baseUrl = baseUrl;
             return this;
         }
-        
+
         public Builder signingKey(String signingKey) {
             this.signingKey = signingKey;
             return this;
         }
-        
+
         public Builder multipartSettings(long minPartSize, long maxPartSize, int maxParts) {
             this.multipartMinPartSize = minPartSize;
             this.multipartMaxPartSize = maxPartSize;
             this.multipartMaxParts = maxParts;
             return this;
         }
-        
+
         public Builder defaultUrlExpirySeconds(long seconds) {
             this.defaultUrlExpirySeconds = seconds;
             return this;
         }
-        
+
+        public Builder fromProperties(Properties props) {
+            return fromResolver(props::getProperty);
+        }
+
+        public Builder fromMap(Map<String, String> map) {
+            return fromResolver(map::get);
+        }
+
+        public Builder fromResolver(Function<String, String> resolver) {
+
+            String provider = resolver.apply("storage.provider");
+            if (provider != null) {
+                this.providerType = ProviderType.valueOf(provider.toUpperCase());
+            }
+
+            this.basePath = value(resolver, "storage.basePath", this.basePath);
+            this.endpoint = value(resolver, "storage.endpoint", this.endpoint);
+            this.region = value(resolver, "storage.region", this.region);
+            this.accessKey = value(resolver, "storage.accessKey", this.accessKey);
+            this.secretKey = value(resolver, "storage.secretKey", this.secretKey);
+            this.sessionToken = value(resolver, "storage.sessionToken", this.sessionToken);
+            this.baseUrl = value(resolver, "storage.baseUrl", this.baseUrl);
+            this.signingKey = value(resolver, "storage.signingKey", this.signingKey);
+            this.bucketPrefix = value(resolver, "storage.bucketPrefix", this.bucketPrefix);
+
+            String pathStyle = resolver.apply("storage.pathStyleAccess");
+            if (pathStyle != null) {
+                this.pathStyleAccess = Boolean.parseBoolean(pathStyle);
+            }
+
+            String https = resolver.apply("storage.useHttps");
+            if (https != null) {
+                this.useHttps = Boolean.parseBoolean(https);
+            }
+
+            String connTimeout = resolver.apply("storage.connectionTimeout");
+            if (connTimeout != null) {
+                this.connectionTimeout = Integer.parseInt(connTimeout);
+            }
+
+            String sockTimeout = resolver.apply("storage.socketTimeout");
+            if (sockTimeout != null) {
+                this.socketTimeout = Integer.parseInt(sockTimeout);
+            }
+
+            String maxConn = resolver.apply("storage.maxConnections");
+            if (maxConn != null) {
+                this.maxConnections = Integer.parseInt(maxConn);
+            }
+
+            String minPart = resolver.apply("storage.multipart.minPartSize");
+            if (minPart != null) {
+                this.multipartMinPartSize = Long.parseLong(minPart);
+            }
+
+            String maxPart = resolver.apply("storage.multipart.maxPartSize");
+            if (maxPart != null) {
+                this.multipartMaxPartSize = Long.parseLong(maxPart);
+            }
+
+            String maxParts = resolver.apply("storage.multipart.maxParts");
+            if (maxParts != null) {
+                this.multipartMaxParts = Integer.parseInt(maxParts);
+            }
+
+            String expiry = resolver.apply("storage.defaultUrlExpirySeconds");
+            if (expiry != null) {
+                this.defaultUrlExpirySeconds = Long.parseLong(expiry);
+            }
+
+            return this;
+        }
+
+        private String value(Function<String, String> resolver, String key, String current) {
+            String v = resolver.apply(key);
+            return v != null ? v : current;
+        }
+
         public StorageConfig build() {
             return new StorageConfig(this);
         }
     }
-    
-    public static StorageConfig fromProperties(InputStream propsStream) throws Exception {
-        Properties props = new Properties();
-        props.load(propsStream);
-        
-        Builder builder = new Builder();
-        
-        String provider = props.getProperty("storage.provider", "LOCAL");
-        try {
-            builder.provider(ProviderType.valueOf(provider.toUpperCase()));
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("Invalid provider type: " + provider);
-        }
-        
-        if (props.containsKey("storage.basePath")) {
-            builder.basePath(props.getProperty("storage.basePath"));
-        }
-        
-        if (props.containsKey("storage.endpoint")) {
-            builder.endpoint(props.getProperty("storage.endpoint"));
-        }
-        
-        if (props.containsKey("storage.region")) {
-            builder.region(props.getProperty("storage.region"));
-        }
-        
-        if (props.containsKey("storage.accessKey") && props.containsKey("storage.secretKey")) {
-            builder.credentials(
-                props.getProperty("storage.accessKey"),
-                props.getProperty("storage.secretKey"),
-                props.getProperty("storage.sessionToken", null)
-            );
-        }
-        
-        if (props.containsKey("storage.pathStyleAccess")) {
-            builder.pathStyleAccess(Boolean.parseBoolean(props.getProperty("storage.pathStyleAccess")));
-        }
-        
-        if (props.containsKey("storage.useHttps")) {
-            builder.useHttps(Boolean.parseBoolean(props.getProperty("storage.useHttps")));
-        }
-        
-        if (props.containsKey("storage.baseUrl")) {
-            builder.baseUrl(props.getProperty("storage.baseUrl"));
-        }
-        
-        if (props.containsKey("storage.signingKey")) {
-            builder.signingKey(props.getProperty("storage.signingKey"));
-        }
-        
-        if (props.containsKey("storage.bucketPrefix")) {
-            builder.bucketPrefix(props.getProperty("storage.bucketPrefix"));
-        }
-        
-        return builder.build();
+
+    /**
+     * Convenience plug-and-play entry point.
+     * Reads from JVM system properties first, then OS environment variables.
+     */
+    public static StorageConfig fromSystemEnvironment() {
+        return new Builder()
+                .fromResolver(key -> {
+                    String v = System.getProperty(key);
+                    if (v != null) {
+                        return v;
+                    }
+                    return System.getenv(key.replace('.', '_').toUpperCase());
+                })
+                .build();
     }
-    
+
     // Getters
+
     public ProviderType getProviderType() { return providerType; }
     public String getBasePath() { return basePath; }
     public String getEndpoint() { return endpoint; }

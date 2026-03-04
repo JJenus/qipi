@@ -4,6 +4,12 @@ echo "==================================="
 echo "  QIPI Storage Demo - Termux/Java 17"
 echo "==================================="
 
+# move to project root
+cd ..
+
+#copy demo to project app path 
+cp -r demo ./src/main/java/com/jjenus/qipi/
+
 # Disable Jansi/JLine to avoid native library issues
 export MAVEN_OPTS="-Dorg.jline.terminal.dumb=true -Djansi.passthrough=true"
 
@@ -40,3 +46,6 @@ java -cp target/classes \
      storage-demo.properties
 
 echo -e "\n==================================="
+
+# clean up demo
+rm -r ./src/main/java/com/jjenus/qipi/demo

@@ -231,738 +231,6 @@ public interface Storage extends AutoCloseable {
 }
 
 
-===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/src/main/java/com/jjenus/qipi/providers/S3StorageProvider.java =====
-
-package com.jjenus.storage.providers;
-
-import com.jjenus.storage.config.StorageConfig;
-import com.jjenus.storage.core.Storage;
-import com.jjenus.storage.core.StorageException;
-import com.jjenus.storage.model.FileInfo;
-import com.jjenus.storage.model.StorageUrl;
-import com.jjenus.storage.model.UploadPartResult;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.core.ResponseInputStream;
-import software.amazon.awssdk.core.exception.SdkException;
-import software.amazon.awssdk.core.sync.RequestBody;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.S3Configuration;
-import software.amazon.awssdk.services.s3.model.*;
-import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
-import software.amazon.awssdk.services.s3.presigner.S3Presigner;
-import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
-import software.amazon.awssdk.services.s3.presigner.model.PresignedGetObjectRequest;
-import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
-import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
-
-import java.io.InputStream;
-import java.net.URI;
-import java.net.URL;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
-
-public class S3StorageProvider implements Storage {
-    
-    private final S3Client s3Client;
-    private final S3Presigner s3Presigner;
-    private final StorageConfig config;
-    private final Map<String, List<CompletedPart>> multipartParts = new ConcurrentHashMap<>();
-    
-    public S3StorageProvider(StorageConfig config) {
-        this.config = config;
-        
-        var builder = S3Client.builder();
-        var presignerBuilder = S3Presigner.builder();
-        
-        // Configure endpoint if provided (for MinIO)
-        if (config.getEndpoint() != null && !config.getEndpoint().isEmpty()) {
-            URI endpointUri = URI.create(
-                (config.isUseHttps() ? "https://" : "http://") + 
-                config.getEndpoint().replace("http://", "").replace("https://", "")
-            );
-            builder.endpointOverride(endpointUri);
-            presignerBuilder.endpointOverride(endpointUri);
-        }
-        
-        // Configure credentials if provided
-        if (config.getAccessKey() != null && !config.getAccessKey().isEmpty()) {
-            AwsBasicCredentials credentials = AwsBasicCredentials.create(
-                config.getAccessKey(), 
-                config.getSecretKey()
-            );
-            builder.credentialsProvider(StaticCredentialsProvider.create(credentials));
-            presignerBuilder.credentialsProvider(StaticCredentialsProvider.create(credentials));
-        }
-        
-        // Configure region
-        if (config.getRegion() != null && !config.getRegion().isEmpty()) {
-            builder.region(Region.of(config.getRegion()));
-            presignerBuilder.region(Region.of(config.getRegion()));
-        }
-        
-        // Configure path style access for MinIO
-        builder.serviceConfiguration(S3Configuration.builder()
-            .pathStyleAccessEnabled(config.isPathStyleAccess())
-            .build());
-        
-        this.s3Client = builder.build();
-        this.s3Presigner = presignerBuilder.build();
-    }
-    
-    @Override
-    public void createBucket(String bucketName) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            CreateBucketRequest request = CreateBucketRequest.builder()
-                .bucket(fullBucketName)
-                .build();
-            s3Client.createBucket(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to create bucket: " + bucketName, e);
-        }
-    }
-    
-    @Override
-    public boolean bucketExists(String bucketName) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            HeadBucketRequest request = HeadBucketRequest.builder()
-                .bucket(fullBucketName)
-                .build();
-            s3Client.headBucket(request);
-            return true;
-        } catch (NoSuchBucketException e) {
-            return false;
-        } catch (SdkException e) {
-            throw new StorageException("Failed to check bucket existence", e);
-        }
-    }
-    
-    @Override
-    public void deleteBucket(String bucketName) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            DeleteBucketRequest request = DeleteBucketRequest.builder()
-                .bucket(fullBucketName)
-                .build();
-            s3Client.deleteBucket(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to delete bucket: " + bucketName, e);
-        }
-    }
-    
-    @Override
-    public List<String> listBuckets() throws StorageException {
-        try {
-            ListBucketsResponse response = s3Client.listBuckets();
-            return response.buckets().stream()
-                .map(bucket -> stripBucketPrefix(bucket.name()))
-                .collect(Collectors.toList());
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to list buckets", e);
-        }
-    }
-    
-    @Override
-    public FileInfo putObject(String bucketName, String objectKey, InputStream data,
-                              long contentLength, String contentType,
-                              Map<String, String> metadata) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            PutObjectRequest.Builder requestBuilder = PutObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .contentType(contentType);
-            
-            if (metadata != null && !metadata.isEmpty()) {
-                requestBuilder.metadata(metadata);
-            }
-            
-            PutObjectResponse response = s3Client.putObject(
-                requestBuilder.build(),
-                RequestBody.fromInputStream(data, contentLength)
-            );
-            
-            return buildFileInfo(fullBucketName, objectKey, response);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to put object: " + objectKey, e);
-        }
-    }
-    
-    @Override
-    public FileInfo putObject(String bucketName, String objectKey, byte[] data,
-                              String contentType, Map<String, String> metadata) 
-            throws StorageException {
-        try (InputStream is = new java.io.ByteArrayInputStream(data)) {
-            return putObject(bucketName, objectKey, is, data.length, contentType, metadata);
-        } catch (Exception e) {
-            throw new StorageException("Failed to put object: " + objectKey, e);
-        }
-    }
-    
-    @Override
-    public InputStream getObject(String bucketName, String objectKey) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            GetObjectRequest request = GetObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .build();
-            
-            return s3Client.getObject(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to get object: " + objectKey, e);
-        }
-    }
-    
-    @Override
-    public InputStream getObjectRange(String bucketName, String objectKey, long start, long end) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            GetObjectRequest request = GetObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .range("bytes=" + start + "-" + end)
-                .build();
-            
-            return s3Client.getObject(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to get object range: " + objectKey, e);
-        }
-    }
-    
-    @Override
-    public void deleteObject(String bucketName, String objectKey) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            DeleteObjectRequest request = DeleteObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .build();
-            s3Client.deleteObject(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to delete object: " + objectKey, e);
-        }
-    }
-    
-    @Override
-    public boolean objectExists(String bucketName, String objectKey) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            HeadObjectRequest request = HeadObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .build();
-            s3Client.headObject(request);
-            return true;
-        } catch (NoSuchKeyException e) {
-            return false;
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to check object existence", e);
-        }
-    }
-    
-    @Override
-    public String initiateMultipartUpload(String bucketName, String objectKey,
-                                          String contentType, Map<String, String> metadata) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            CreateMultipartUploadRequest.Builder requestBuilder = CreateMultipartUploadRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .contentType(contentType);
-            
-            if (metadata != null && !metadata.isEmpty()) {
-                requestBuilder.metadata(metadata);
-            }
-            
-            CreateMultipartUploadResponse response = s3Client.createMultipartUpload(
-                requestBuilder.build()
-            );
-            
-            return response.uploadId();
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to initiate multipart upload", e);
-        }
-    }
-    
-    @Override
-    public UploadPartResult uploadPart(String bucketName, String objectKey, String uploadId,
-                                       int partNumber, InputStream data, long partSize) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            UploadPartRequest request = UploadPartRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .uploadId(uploadId)
-                .partNumber(partNumber)
-                .build();
-            
-            UploadPartResponse response = s3Client.uploadPart(
-                request,
-                RequestBody.fromInputStream(data, partSize)
-            );
-            
-            return new UploadPartResult(partNumber, response.eTag(), partSize);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to upload part " + partNumber, e);
-        }
-    }
-    
-    @Override
-    public FileInfo completeMultipartUpload(String bucketName, String objectKey,
-                                            String uploadId, List<UploadPartResult> parts) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            List<CompletedPart> completedParts = parts.stream()
-                .map(part -> CompletedPart.builder()
-                    .partNumber(part.getPartNumber())
-                    .eTag(part.getEtag())
-                    .build())
-                .collect(Collectors.toList());
-            
-            CompleteMultipartUploadRequest request = CompleteMultipartUploadRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .uploadId(uploadId)
-                .multipartUpload(CompletedMultipartUpload.builder()
-                    .parts(completedParts)
-                    .build())
-                .build();
-            
-            CompleteMultipartUploadResponse response = s3Client.completeMultipartUpload(request);
-            
-            FileInfo fileInfo = new FileInfo(bucketName, objectKey, 0, Instant.now());
-            fileInfo.setEtag(response.eTag());
-            fileInfo.setMultipart(true);
-            
-            return fileInfo;
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to complete multipart upload", e);
-        }
-    }
-    
-    @Override
-    public void abortMultipartUpload(String bucketName, String objectKey, String uploadId) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            AbortMultipartUploadRequest request = AbortMultipartUploadRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .uploadId(uploadId)
-                .build();
-            
-            s3Client.abortMultipartUpload(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to abort multipart upload", e);
-        }
-    }
-    
-    @Override
-    public List<String> listMultipartUploads(String bucketName) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            ListMultipartUploadsRequest request = ListMultipartUploadsRequest.builder()
-                .bucket(fullBucketName)
-                .build();
-            
-            ListMultipartUploadsResponse response = s3Client.listMultipartUploads(request);
-            
-            return response.uploads().stream()
-                .map(MultipartUpload::uploadId)
-                .collect(Collectors.toList());
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to list multipart uploads", e);
-        }
-    }
-    
-    @Override
-    public StorageUrl generateSignedUrl(String bucketName, String objectKey,
-                                        HttpMethod method, long expiryInSeconds) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            if (method == HttpMethod.GET) {
-                GetObjectRequest getRequest = GetObjectRequest.builder()
-                    .bucket(fullBucketName)
-                    .key(objectKey)
-                    .build();
-                
-                GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
-                    .getObjectRequest(getRequest)
-                    .signatureDuration(Duration.ofSeconds(expiryInSeconds))
-                    .build();
-                
-                PresignedGetObjectRequest presigned = s3Presigner.presignGetObject(presignRequest);
-                
-                return new StorageUrl(
-                    presigned.url(),
-                    Instant.now().plusSeconds(expiryInSeconds),
-                    presigned.signedHeaders(),
-                    StorageUrl.UrlType.SIGNED
-                );
-                
-            } else if (method == HttpMethod.PUT) {
-                PutObjectRequest putRequest = PutObjectRequest.builder()
-                    .bucket(fullBucketName)
-                    .key(objectKey)
-                    .build();
-                
-                PutObjectPresignRequest presignRequest = PutObjectPresignRequest.builder()
-                    .putObjectRequest(putRequest)
-                    .signatureDuration(Duration.ofSeconds(expiryInSeconds))
-                    .build();
-                
-                PresignedPutObjectRequest presigned = s3Presigner.presignPutObject(presignRequest);
-                
-                return new StorageUrl(
-                    presigned.url(),
-                    Instant.now().plusSeconds(expiryInSeconds),
-                    presigned.signedHeaders(),
-                    StorageUrl.UrlType.UPLOAD
-                );
-            }
-            
-            throw new StorageException("Unsupported HTTP method for signed URL: " + method);
-            
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to generate signed URL", e);
-        }
-    }
-    
-    @Override
-    public StorageUrl generatePublicUrl(String bucketName, String objectKey) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            // Construct public URL based on endpoint or default AWS URL
-            String url;
-            if (config.getBaseUrl() != null && !config.getBaseUrl().isEmpty()) {
-                url = config.getBaseUrl() + bucketName + "/" + objectKey;
-            } else if (config.getEndpoint() != null) {
-                String protocol = config.isUseHttps() ? "https://" : "http://";
-                url = protocol + config.getEndpoint() + "/" + fullBucketName + "/" + objectKey;
-            } else {
-                // Default AWS URL format
-                url = "https://" + fullBucketName + ".s3." + config.getRegion() + ".amazonaws.com/" + objectKey;
-            }
-            
-            return new StorageUrl(
-                new URL(url),
-                null,
-                Collections.emptyMap(),
-                StorageUrl.UrlType.PUBLIC
-            );
-        } catch (Exception e) {
-            throw new StorageException("Failed to generate public URL", e);
-        }
-    }
-    
-    @Override
-    public StorageUrl generateUploadUrl(String bucketName, String objectKey,
-                                        String contentType, long expiryInSeconds) 
-            throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            PutObjectRequest putRequest = PutObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .contentType(contentType)
-                .build();
-            
-            PutObjectPresignRequest presignRequest = PutObjectPresignRequest.builder()
-                .putObjectRequest(putRequest)
-                .signatureDuration(Duration.ofSeconds(expiryInSeconds))
-                .build();
-            
-            PresignedPutObjectRequest presigned = s3Presigner.presignPutObject(presignRequest);
-            
-            return new StorageUrl(
-                presigned.url(),
-                Instant.now().plusSeconds(expiryInSeconds),
-                presigned.signedHeaders(),
-                StorageUrl.UrlType.UPLOAD
-            );
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to generate upload URL", e);
-        }
-    }
-    
-    @Override
-    public FileInfo getObjectInfo(String bucketName, String objectKey) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            HeadObjectRequest request = HeadObjectRequest.builder()
-                .bucket(fullBucketName)
-                .key(objectKey)
-                .build();
-            
-            HeadObjectResponse response = s3Client.headObject(request);
-            
-            return buildFileInfo(fullBucketName, objectKey, response);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to get object info", e);
-        }
-    }
-    
-    @Override
-    public void updateObjectMetadata(String bucketName, String objectKey,
-                                     Map<String, String> metadata) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            // First copy the object to itself with new metadata
-            CopyObjectRequest request = CopyObjectRequest.builder()
-                .sourceBucket(fullBucketName)
-                .sourceKey(objectKey)
-                .destinationBucket(fullBucketName)
-                .destinationKey(objectKey)
-                .metadata(metadata)
-                .metadataDirective(MetadataDirective.REPLACE)
-                .build();
-            
-            s3Client.copyObject(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to update metadata", e);
-        }
-    }
-    
-    @Override
-    public List<FileInfo> listObjects(String bucketName) throws StorageException {
-        return listObjects(bucketName, "");
-    }
-    
-    @Override
-    public List<FileInfo> listObjects(String bucketName, String prefix) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            ListObjectsV2Request request = ListObjectsV2Request.builder()
-                .bucket(fullBucketName)
-                .prefix(prefix)
-                .build();
-            
-            ListObjectsV2Iterable responses = s3Client.listObjectsV2Paginator(request);
-            
-            List<FileInfo> objects = new ArrayList<>();
-            for (ListObjectsV2Response response : responses) {
-                for (S3Object s3Object : response.contents()) {
-                    FileInfo fileInfo = new FileInfo(
-                        bucketName,
-                        s3Object.key(),
-                        s3Object.size(),
-                        s3Object.lastModified()
-                    );
-                    fileInfo.setEtag(s3Object.eTag());
-                    fileInfo.setStorageClass(FileInfo.StorageClass.valueOf(s3Object.storageClassAsString()));
-                    objects.add(fileInfo);
-                }
-            }
-            
-            return objects;
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to list objects", e);
-        }
-    }
-    
-    @Override
-    public CompletableFuture<FileInfo> putObjectAsync(String bucketName, String objectKey,
-                                                       InputStream data, long contentLength,
-                                                       String contentType,
-                                                       Map<String, String> metadata,
-                                                       ProgressCallback progressCallback) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                // In a real implementation, you'd use a custom async client
-                return putObject(bucketName, objectKey, data, contentLength, contentType, metadata);
-            } catch (StorageException e) {
-                throw new RuntimeException(e);
-            }
-        });
-    }
-    
-    @Override
-    public CompletableFuture<InputStream> getObjectAsync(String bucketName, String objectKey,
-                                                          ProgressCallback progressCallback) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                return getObject(bucketName, objectKey);
-            } catch (StorageException e) {
-                throw new RuntimeException(e);
-            }
-        });
-    }
-    
-    @Override
-    public FileInfo copyObject(String sourceBucket, String sourceKey,
-                                String destinationBucket, String destinationKey) 
-            throws StorageException {
-        try {
-            String fullSourceBucket = getFullBucketName(sourceBucket);
-            String fullDestBucket = getFullBucketName(destinationBucket);
-            
-            CopyObjectRequest request = CopyObjectRequest.builder()
-                .sourceBucket(fullSourceBucket)
-                .sourceKey(sourceKey)
-                .destinationBucket(fullDestBucket)
-                .destinationKey(destinationKey)
-                .build();
-            
-            CopyObjectResponse response = s3Client.copyObject(request);
-            
-            return new FileInfo(destinationBucket, destinationKey, 0, Instant.now());
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to copy object", e);
-        }
-    }
-    
-    @Override
-    public FileInfo moveObject(String sourceBucket, String sourceKey,
-                                String destinationBucket, String destinationKey) 
-            throws StorageException {
-        try {
-            // Copy first
-            FileInfo fileInfo = copyObject(sourceBucket, sourceKey, destinationBucket, destinationKey);
-            
-            // Then delete source
-            deleteObject(sourceBucket, sourceKey);
-            
-            return fileInfo;
-        } catch (StorageException e) {
-            throw new StorageException("Failed to move object", e);
-        }
-    }
-    
-    @Override
-    public void deleteObjects(String bucketName, List<String> objectKeys) throws StorageException {
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            List<ObjectIdentifier> objects = objectKeys.stream()
-                .map(key -> ObjectIdentifier.builder().key(key).build())
-                .collect(Collectors.toList());
-            
-            DeleteObjectsRequest request = DeleteObjectsRequest.builder()
-                .bucket(fullBucketName)
-                .delete(Delete.builder().objects(objects).build())
-                .build();
-            
-            s3Client.deleteObjects(request);
-        } catch (S3Exception e) {
-            throw new StorageException("Failed to delete multiple objects", e);
-        }
-    }
-    
-    @Override
-    public PresignedPost generatePresignedPost(String bucketName, String objectKey,
-                                                Map<String, String> conditions,
-                                                long expiryInSeconds) throws StorageException {
-        // Note: AWS SDK v2 doesn't have direct POST policy generation in presigner
-        // This is a simplified version
-        try {
-            String fullBucketName = getFullBucketName(bucketName);
-            
-            Map<String, String> fields = new HashMap<>();
-            fields.put("key", objectKey);
-            fields.put("bucket", fullBucketName);
-            
-            if (conditions != null) {
-                fields.putAll(conditions);
-            }
-            
-            String url;
-            if (config.getEndpoint() != null) {
-                url = (config.isUseHttps() ? "https://" : "http://") + 
-                      config.getEndpoint() + "/" + fullBucketName;
-            } else {
-                url = "https://" + fullBucketName + ".s3.amazonaws.com/";
-            }
-            
-            return new PresignedPost(url, fields);
-        } catch (Exception e) {
-            throw new StorageException("Failed to generate presigned POST", e);
-        }
-    }
-    
-    @Override
-    public void close() throws Exception {
-        if (s3Client != null) {
-            s3Client.close();
-        }
-        if (s3Presigner != null) {
-            s3Presigner.close();
-        }
-    }
-    
-    // Helper methods
-    private String getFullBucketName(String bucketName) {
-        if (config.getBucketPrefix() != null && !config.getBucketPrefix().isEmpty()) {
-            return config.getBucketPrefix() + "-" + bucketName;
-        }
-        return bucketName;
-    }
-    
-    private String stripBucketPrefix(String fullBucketName) {
-        if (config.getBucketPrefix() != null && !config.getBucketPrefix().isEmpty()) {
-            String prefix = config.getBucketPrefix() + "-";
-            if (fullBucketName.startsWith(prefix)) {
-                return fullBucketName.substring(prefix.length());
-            }
-        }
-        return fullBucketName;
-    }
-    
-    private FileInfo buildFileInfo(String bucketName, String objectKey, 
-                                    PutObjectResponse response) {
-        FileInfo fileInfo = new FileInfo(
-            stripBucketPrefix(bucketName),
-            objectKey,
-            0, // Size not available in PutObjectResponse
-            Instant.now()
-        );
-        fileInfo.setEtag(response.eTag());
-        if (response.versionId() != null) {
-            fileInfo.setVersionId(response.versionId());
-        }
-        return fileInfo;
-    }
-    
-    private FileInfo buildFileInfo(String bucketName, String objectKey,
-                                    HeadObjectResponse response) {
-        FileInfo fileInfo = new FileInfo(
-            stripBucketPrefix(bucketName),
-            objectKey,
-            response.contentLength(),
-            response.lastModified()
-        );
-        fileInfo.setEtag(response.eTag());
-        fileInfo.setContentType(response.contentType());
-        fileInfo.setUserMetadata(response.metadata());
-        return fileInfo;
-    }
-}
-
-
 ===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/src/main/java/com/jjenus/qipi/providers/LocalStorageProvider.java =====
 
 package com.jjenus.qipi.providers;
@@ -976,9 +244,11 @@ import com.jjenus.qipi.model.UploadPartResult;
 
 import java.io.*;
 import java.net.URL;
+import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -990,6 +260,8 @@ public class LocalStorageProvider implements Storage {
     private final Path rootPath;
     private final StorageConfig config;
     private final Map<String, MultipartUpload> activeMultipartUploads = new ConcurrentHashMap<>();
+    private final Thread cleanupThread;
+    private volatile boolean running = true;
     
     private static class MultipartUpload {
         final String uploadId;
@@ -997,7 +269,7 @@ public class LocalStorageProvider implements Storage {
         final String objectKey;
         final String contentType;
         final Map<String, String> metadata;
-        final List<UploadPartResult> parts = new ArrayList<>();
+        final List<UploadPartResult> parts = Collections.synchronizedList(new ArrayList<>());
         final Path tempDir;
         final Instant createdAt;
         
@@ -1013,14 +285,63 @@ public class LocalStorageProvider implements Storage {
         }
     }
     
-    public LocalStorageProvider(StorageConfig config) throws IOException {
+    public LocalStorageProvider(StorageConfig config) throws StorageException {
         this.config = config;
-        this.rootPath = Paths.get(config.getBasePath()).toAbsolutePath();
-        Files.createDirectories(rootPath);
+        try {
+            this.rootPath = Paths.get(config.getBasePath()).toAbsolutePath().normalize();
+            Files.createDirectories(rootPath);
+        } catch (IOException e) {
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to initialize local storage at path: " + config.getBasePath(), e);
+        }
+        
+        // Start cleanup thread for stale multipart uploads
+        this.cleanupThread = new Thread(this::cleanupTask);
+        this.cleanupThread.setDaemon(true);
+        this.cleanupThread.start();
+    }
+    
+    private void cleanupTask() {
+        while (running) {
+            try {
+                Thread.sleep(3600000); // 1 hour
+                cleanupStaleMultipartUploads();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+    
+    private void cleanupStaleMultipartUploads() {
+        Instant cutoff = Instant.now().minusSeconds(86400); // 24 hours
+        List<String> staleUploads = activeMultipartUploads.entrySet().stream()
+            .filter(entry -> entry.getValue().createdAt.isBefore(cutoff))
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toList());
+        
+        for (String uploadId : staleUploads) {
+            MultipartUpload upload = activeMultipartUploads.remove(uploadId);
+            if (upload != null) {
+                try {
+                    deleteDirectory(upload.tempDir);
+                } catch (IOException e) {
+                    // Log but continue - use System.err for now, consider adding proper logging
+                    System.err.println("Failed to delete stale multipart upload directory: " + e.getMessage());
+                }
+            }
+        }
     }
     
     private Path getBucketPath(String bucketName) throws StorageException {
-        Path bucketPath = rootPath.resolve(bucketName);
+        Path bucketPath = rootPath.resolve(bucketName).normalize();
+        
+        // Security check - ensure path is within root
+        if (!bucketPath.startsWith(rootPath)) {
+            throw new StorageException(StorageException.ErrorCode.ACCESS_DENIED,
+                "Invalid bucket path", bucketName, null);
+        }
+        
         if (!Files.exists(bucketPath)) {
             throw new StorageException(StorageException.ErrorCode.BUCKET_NOT_FOUND,
                 "Bucket does not exist: " + bucketName, bucketName, null);
@@ -1029,20 +350,21 @@ public class LocalStorageProvider implements Storage {
     }
     
     private Path getObjectPath(String bucketName, String objectKey) throws StorageException {
-        Path bucketPath = getBucketPath(bucketName);
+        Path bucketPath = rootPath.resolve(bucketName).normalize();
         
-        // Sanitize object key to prevent path traversal
-        String sanitizedKey = objectKey.replace("..", "").replace("/", File.separator);
-        Path objectPath = bucketPath.resolve(sanitizedKey);
+        // Security check - ensure bucket path is within root
+        if (!bucketPath.startsWith(rootPath)) {
+            throw new StorageException(StorageException.ErrorCode.ACCESS_DENIED,
+                "Invalid bucket path", bucketName, null);
+        }
+        
+        // Normalize and resolve object key
+        Path objectPath = bucketPath.resolve(objectKey).normalize();
         
         // Ensure the resolved path is still within the bucket
-        try {
-            if (!objectPath.toRealPath().startsWith(bucketPath.toRealPath())) {
-                throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
-                    "Invalid object key: path traversal detected", bucketName, objectKey);
-            }
-        } catch (IOException e) {
-            throw new StorageException("Error resolving path", e);
+        if (!objectPath.startsWith(bucketPath)) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                "Invalid object key: path traversal detected", bucketName, objectKey);
         }
         
         return objectPath;
@@ -1051,27 +373,37 @@ public class LocalStorageProvider implements Storage {
     @Override
     public void createBucket(String bucketName) throws StorageException {
         try {
-            Path bucketPath = rootPath.resolve(bucketName);
+            Path bucketPath = rootPath.resolve(bucketName).normalize();
+            
+            // Security check
+            if (!bucketPath.startsWith(rootPath)) {
+                throw new StorageException(StorageException.ErrorCode.ACCESS_DENIED,
+                    "Invalid bucket name", bucketName, null);
+            }
+            
             Files.createDirectories(bucketPath);
         } catch (IOException e) {
-            throw new StorageException("Failed to create bucket: " + bucketName, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to create bucket: " + bucketName, e);
         }
     }
     
     @Override
     public boolean bucketExists(String bucketName) throws StorageException {
-        Path bucketPath = rootPath.resolve(bucketName);
+        Path bucketPath = rootPath.resolve(bucketName).normalize();
+        
+        // Security check
+        if (!bucketPath.startsWith(rootPath)) {
+            return false;
+        }
+        
         return Files.exists(bucketPath) && Files.isDirectory(bucketPath);
     }
     
     @Override
     public void deleteBucket(String bucketName) throws StorageException {
         try {
-            Path bucketPath = rootPath.resolve(bucketName);
-            if (!Files.exists(bucketPath)) {
-                throw new StorageException(StorageException.ErrorCode.BUCKET_NOT_FOUND,
-                    "Bucket not found: " + bucketName, bucketName, null);
-            }
+            Path bucketPath = getBucketPath(bucketName);
             
             // Check if bucket is empty
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(bucketPath)) {
@@ -1083,7 +415,8 @@ public class LocalStorageProvider implements Storage {
             
             Files.delete(bucketPath);
         } catch (IOException e) {
-            throw new StorageException("Failed to delete bucket: " + bucketName, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to delete bucket: " + bucketName, e);
         }
     }
     
@@ -1098,7 +431,8 @@ public class LocalStorageProvider implements Storage {
             }
             return buckets;
         } catch (IOException e) {
-            throw new StorageException("Failed to list buckets", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to list buckets", e);
         }
     }
     
@@ -1106,13 +440,14 @@ public class LocalStorageProvider implements Storage {
     public FileInfo putObject(String bucketName, String objectKey, InputStream data,
                               long contentLength, String contentType,
                               Map<String, String> metadata) throws StorageException {
+        Path objectPath = null;
         try {
-            Path bucketPath = rootPath.resolve(bucketName);
+            Path bucketPath = rootPath.resolve(bucketName).normalize();
             if (!Files.exists(bucketPath)) {
                 createBucket(bucketName);
             }
             
-            Path objectPath = bucketPath.resolve(objectKey);
+            objectPath = getObjectPath(bucketName, objectKey);
             Files.createDirectories(objectPath.getParent());
             
             // Calculate ETag (MD5 of content)
@@ -1133,14 +468,51 @@ public class LocalStorageProvider implements Storage {
             byte[] digest = md.digest();
             String etag = bytesToHex(digest);
             
+            // Save metadata
+            if (metadata != null || contentType != null) {
+                saveMetadata(objectPath, contentType, metadata);
+            }
+            
             FileInfo fileInfo = new FileInfo(bucketName, objectKey, contentLength, Instant.now());
             fileInfo.setEtag(etag);
             fileInfo.setContentType(contentType);
             fileInfo.setUserMetadata(metadata != null ? metadata : new HashMap<>());
             
             return fileInfo;
-        } catch (Exception e) {
-            throw new StorageException("Failed to put object: " + objectKey, e);
+            
+        } catch (NoSuchAlgorithmException e) {
+            // This shouldn't happen as MD5 is always available
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "MD5 algorithm not available", e);
+        } catch (IOException e) {
+            // Clean up partial file if upload failed
+            if (objectPath != null) {
+                try {
+                    Files.deleteIfExists(objectPath);
+                } catch (IOException ex) {
+                    // Ignore cleanup errors
+                }
+            }
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to put object: " + objectKey, e);
+        }
+    }
+    
+    private void saveMetadata(Path objectPath, String contentType, Map<String, String> metadata) 
+            throws IOException {
+        Path metaPath = objectPath.resolveSibling(objectPath.getFileName() + ".meta");
+        Properties props = new Properties();
+        
+        if (contentType != null) {
+            props.setProperty("content-type", contentType);
+        }
+        
+        if (metadata != null) {
+            props.putAll(metadata);
+        }
+        
+        try (OutputStream os = Files.newOutputStream(metaPath, StandardOpenOption.CREATE)) {
+            props.store(os, "File metadata");
         }
     }
     
@@ -1148,9 +520,10 @@ public class LocalStorageProvider implements Storage {
     public FileInfo putObject(String bucketName, String objectKey, byte[] data,
                               String contentType, Map<String, String> metadata) 
             throws StorageException {
-        try (ByteArrayInputStream bais = new ByteArrayInputStream(data)) {
-            return putObject(bucketName, objectKey, bais, data.length, contentType, metadata);
-        }
+        // Using ByteArrayInputStream without try-with-resources since it doesn't need closing
+        ByteArrayInputStream bais = new ByteArrayInputStream(data);
+        return putObject(bucketName, objectKey, bais, data.length, contentType, metadata);
+        // No need to close ByteArrayInputStream - it's a no-op
     }
     
     @Override
@@ -1165,7 +538,8 @@ public class LocalStorageProvider implements Storage {
             
             return Files.newInputStream(objectPath);
         } catch (IOException e) {
-            throw new StorageException("Failed to get object: " + objectKey, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to get object: " + objectKey, e);
         }
     }
     
@@ -1183,15 +557,53 @@ public class LocalStorageProvider implements Storage {
             RandomAccessFile raf = new RandomAccessFile(objectPath.toFile(), "r");
             raf.seek(start);
             
-            // Create a limited input stream for the range
-            long length = end - start + 1;
-            byte[] buffer = new byte[(int)length];
-            raf.read(buffer);
-            raf.close();
-            
-            return new ByteArrayInputStream(buffer);
+            // Return channel as InputStream for efficient streaming
+            return new InputStream() {
+                private final FileChannel channel = raf.getChannel();
+                private long position = start;
+                private final long endPosition = end;
+                
+                @Override
+                public int read() throws IOException {
+                    if (position > endPosition) {
+                        return -1;
+                    }
+                    byte[] b = new byte[1];
+                    int read = channel.read(java.nio.ByteBuffer.wrap(b), position);
+                    if (read == 1) {
+                        position++;
+                        return b[0] & 0xFF;
+                    }
+                    return -1;
+                }
+                
+                @Override
+                public int read(byte[] b, int off, int len) throws IOException {
+                    if (position > endPosition) {
+                        return -1;
+                    }
+                    long remaining = endPosition - position + 1;
+                    int bytesToRead = (int) Math.min(len, remaining);
+                    if (bytesToRead <= 0) {
+                        return -1;
+                    }
+                    java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(b, off, bytesToRead);
+                    int read = channel.read(buf, position);
+                    if (read > 0) {
+                        position += read;
+                    }
+                    return read;
+                }
+                
+                @Override
+                public void close() throws IOException {
+                    channel.close();
+                    raf.close();
+                }
+            };
         } catch (IOException e) {
-            throw new StorageException("Failed to get object range: " + objectKey, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to get object range: " + objectKey, e);
         }
     }
     
@@ -1201,20 +613,27 @@ public class LocalStorageProvider implements Storage {
             Path objectPath = getObjectPath(bucketName, objectKey);
             Files.deleteIfExists(objectPath);
             
+            // Delete metadata if exists
+            Path metaPath = objectPath.resolveSibling(objectPath.getFileName() + ".meta");
+            Files.deleteIfExists(metaPath);
+            
             // Clean up empty parent directories
             Path parent = objectPath.getParent();
-            Path bucketPath = rootPath.resolve(bucketName);
+            Path bucketPath = rootPath.resolve(bucketName).normalize();
             
             while (parent != null && !parent.equals(bucketPath)) {
                 try (DirectoryStream<Path> stream = Files.newDirectoryStream(parent)) {
                     if (!stream.iterator().hasNext()) {
                         Files.delete(parent);
+                        parent = parent.getParent();
+                    } else {
+                        break;
                     }
                 }
-                parent = parent.getParent();
             }
         } catch (IOException e) {
-            throw new StorageException("Failed to delete object: " + objectKey, e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to delete object: " + objectKey, e);
         }
     }
     
@@ -1243,7 +662,8 @@ public class LocalStorageProvider implements Storage {
             activeMultipartUploads.put(uploadId, upload);
             return uploadId;
         } catch (IOException e) {
-            throw new StorageException("Failed to initiate multipart upload", e);
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "Failed to initiate multipart upload", e);
         }
     }
     
@@ -1253,7 +673,8 @@ public class LocalStorageProvider implements Storage {
             throws StorageException {
         MultipartUpload upload = activeMultipartUploads.get(uploadId);
         if (upload == null) {
-            throw new StorageException("Invalid upload ID: " + uploadId);
+            throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                "Invalid upload ID: " + uploadId, bucketName, objectKey);
         }
         
         try {
@@ -1279,8 +700,12 @@ public class LocalStorageProvider implements Storage {
             upload.parts.add(result);
             
             return result;
-        } catch (Exception e) {
-            throw new StorageException("Failed to upload part " + partNumber, e);
+        } catch (NoSuchAlgorithmException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "MD5 algorithm not available", e);
+        } catch (IOException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "Failed to upload part " + partNumber, e);
         }
     }
     
@@ -1290,7 +715,8 @@ public class LocalStorageProvider implements Storage {
             throws StorageException {
         MultipartUpload upload = activeMultipartUploads.remove(uploadId);
         if (upload == null) {
-            throw new StorageException("Invalid upload ID: " + uploadId);
+            throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                "Invalid upload ID: " + uploadId, bucketName, objectKey);
         }
         
         try {
@@ -1314,6 +740,9 @@ public class LocalStorageProvider implements Storage {
                 }
             }
             
+            // Save metadata
+            saveMetadata(finalPath, upload.contentType, upload.metadata);
+            
             // Clean up temp directory
             deleteDirectory(upload.tempDir);
             
@@ -1327,8 +756,12 @@ public class LocalStorageProvider implements Storage {
             fileInfo.setMultipart(true);
             
             return fileInfo;
-        } catch (Exception e) {
-            throw new StorageException("Failed to complete multipart upload", e);
+        } catch (NoSuchAlgorithmException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "MD5 algorithm not available", e);
+        } catch (IOException e) {
+            throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                "Failed to complete multipart upload", e);
         }
     }
     
@@ -1340,7 +773,8 @@ public class LocalStorageProvider implements Storage {
             try {
                 deleteDirectory(upload.tempDir);
             } catch (IOException e) {
-                throw new StorageException("Failed to abort multipart upload", e);
+                throw new StorageException(StorageException.ErrorCode.MULTIPART_UPLOAD_ERROR,
+                    "Failed to abort multipart upload", e);
             }
         }
     }
@@ -1366,7 +800,7 @@ public class LocalStorageProvider implements Storage {
             
             String signingKey = config.getSigningKey();
             if (signingKey == null) {
-                signingKey = "default-signing-key";
+                signingKey = "default-signing-key-change-this";
             }
             
             long expiryTime = Instant.now().plusSeconds(expiryInSeconds).toEpochMilli();
@@ -1375,17 +809,18 @@ public class LocalStorageProvider implements Storage {
             String dataToSign = bucketName + ":" + objectKey + ":" + expiryTime + ":" + method;
             String signature = hmacSha256(signingKey, dataToSign);
             
-            String url = baseUrl + bucketName + "/" + objectKey + 
+            String urlString = baseUrl + bucketName + "/" + objectKey + 
                         "?expiry=" + expiryTime + "&signature=" + signature;
             
             return new StorageUrl(
-                new URL(url),
+                new URL(urlString),
                 Instant.now().plusSeconds(expiryInSeconds),
                 Collections.emptyMap(),
                 method == HttpMethod.PUT ? StorageUrl.UrlType.UPLOAD : StorageUrl.UrlType.SIGNED
             );
         } catch (Exception e) {
-            throw new StorageException("Failed to generate signed URL", e);
+            throw new StorageException(StorageException.ErrorCode.URL_GENERATION_ERROR,
+                "Failed to generate signed URL", e);
         }
     }
     
@@ -1397,10 +832,11 @@ public class LocalStorageProvider implements Storage {
                 baseUrl = "http://localhost:8080/files/";
             }
             
-            String url = baseUrl + bucketName + "/" + objectKey;
-            return new StorageUrl(new URL(url), null, Collections.emptyMap(), StorageUrl.UrlType.PUBLIC);
+            String urlString = baseUrl + bucketName + "/" + objectKey;
+            return new StorageUrl(new URL(urlString), null, Collections.emptyMap(), StorageUrl.UrlType.PUBLIC);
         } catch (Exception e) {
-            throw new StorageException("Failed to generate public URL", e);
+            throw new StorageException(StorageException.ErrorCode.URL_GENERATION_ERROR,
+                "Failed to generate public URL", e);
         }
     }
     
@@ -1442,7 +878,8 @@ public class LocalStorageProvider implements Storage {
             
             return fileInfo;
         } catch (IOException e) {
-            throw new StorageException("Failed to get object info", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to get object info", e);
         }
     }
     
@@ -1472,7 +909,8 @@ public class LocalStorageProvider implements Storage {
                 props.store(os, "File metadata");
             }
         } catch (IOException e) {
-            throw new StorageException("Failed to update metadata", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to update metadata", e);
         }
     }
     
@@ -1485,7 +923,13 @@ public class LocalStorageProvider implements Storage {
     public List<FileInfo> listObjects(String bucketName, String prefix) throws StorageException {
         try {
             Path bucketPath = getBucketPath(bucketName);
-            Path searchPath = bucketPath.resolve(prefix);
+            Path searchPath = bucketPath.resolve(prefix).normalize();
+            
+            // Security check
+            if (!searchPath.startsWith(bucketPath)) {
+                throw new StorageException(StorageException.ErrorCode.INVALID_REQUEST,
+                    "Invalid prefix", bucketName, null);
+            }
             
             List<FileInfo> objects = new ArrayList<>();
             
@@ -1498,13 +942,14 @@ public class LocalStorageProvider implements Storage {
                             return FileVisitResult.CONTINUE;
                         }
                         
-                        String relativePath = bucketPath.relativize(file).toString();
-                        objects.add(new FileInfo(
+                        String relativePath = bucketPath.relativize(file).toString().replace('\\', '/');
+                        FileInfo fileInfo = new FileInfo(
                             bucketName,
                             relativePath,
                             attrs.size(),
                             attrs.lastModifiedTime().toInstant()
-                        ));
+                        );
+                        objects.add(fileInfo);
                         return FileVisitResult.CONTINUE;
                     }
                 });
@@ -1512,7 +957,8 @@ public class LocalStorageProvider implements Storage {
             
             return objects;
         } catch (IOException e) {
-            throw new StorageException("Failed to list objects", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to list objects", e);
         }
     }
     
@@ -1524,7 +970,11 @@ public class LocalStorageProvider implements Storage {
                                                        ProgressCallback progressCallback) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                return putObject(bucketName, objectKey, data, contentLength, contentType, metadata);
+                FileInfo result = putObject(bucketName, objectKey, data, contentLength, contentType, metadata);
+                if (progressCallback != null) {
+                    progressCallback.onProgress(contentLength, contentLength);
+                }
+                return result;
             } catch (StorageException e) {
                 throw new RuntimeException(e);
             }
@@ -1563,7 +1013,8 @@ public class LocalStorageProvider implements Storage {
             
             return getObjectInfo(destinationBucket, destinationKey);
         } catch (IOException e) {
-            throw new StorageException("Failed to copy object", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to copy object", e);
         }
     }
     
@@ -1587,7 +1038,8 @@ public class LocalStorageProvider implements Storage {
             
             return getObjectInfo(destinationBucket, destinationKey);
         } catch (IOException e) {
-            throw new StorageException("Failed to move object", e);
+            throw new StorageException(StorageException.ErrorCode.PROVIDER_ERROR,
+                "Failed to move object", e);
         }
     }
     
@@ -1610,6 +1062,7 @@ public class LocalStorageProvider implements Storage {
         Map<String, String> fields = new HashMap<>();
         fields.put("key", objectKey);
         fields.put("bucket", bucketName);
+        fields.put("expires", String.valueOf(Instant.now().plusSeconds(expiryInSeconds).toEpochMilli()));
         
         if (conditions != null) {
             fields.putAll(conditions);
@@ -1620,7 +1073,20 @@ public class LocalStorageProvider implements Storage {
     
     @Override
     public void close() throws Exception {
-        // Nothing to close for local storage
+        running = false;
+        if (cleanupThread != null) {
+            cleanupThread.interrupt();
+        }
+        
+        // Clean up all active multipart uploads
+        for (String uploadId : new ArrayList<>(activeMultipartUploads.keySet())) {
+            try {
+                abortMultipartUpload(null, null, uploadId);
+            } catch (Exception e) {
+                // Log and continue
+                System.err.println("Failed to abort multipart upload during close: " + e.getMessage());
+            }
+        }
     }
     
     // Helper methods
@@ -1661,50 +1127,50 @@ public class LocalStorageProvider implements Storage {
     }
 }
 
-
 ===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/src/main/java/com/jjenus/qipi/config/StorageConfig.java =====
 
 package com.jjenus.qipi.config;
 
-import java.io.InputStream;
-import java.net.URL;
+import java.util.Map;
 import java.util.Properties;
+import java.util.function.Function;
 
-public class StorageConfig {
-    
+/**
+ * Storage configuration.
+ *
+ * Note: Environment variable resolution (${ENV:default}) must be handled
+ * by the host application's configuration system before passing values here.
+ * This class does not perform environment discovery or file loading.
+ */
+public final class StorageConfig {
+
     public enum ProviderType {
-        LOCAL,          // Local filesystem
-        AWS_S3,         // Amazon S3
-        MINIO,          // MinIO (S3-compatible)
-        GCS,            // Google Cloud Storage
-        AZURE_BLOB      // Azure Blob Storage
+        LOCAL, AWS_S3, MINIO, GCS, AZURE_BLOB
     }
-    
-    private ProviderType providerType;
-    private String basePath;                // For local storage
-    private String endpoint;                 // For custom endpoints (MinIO, etc.)
-    private String region;                    // AWS region
-    private String accessKey;
-    private String secretKey;
-    private String sessionToken;
-    private boolean pathStyleAccess;          // For MinIO compatibility
-    private boolean useHttps = true;
-    private int connectionTimeout = 30000;    // milliseconds
-    private int socketTimeout = 60000;         // milliseconds
-    private int maxConnections = 50;
-    private String bucketPrefix;               // Optional prefix for all buckets
-    private String baseUrl;                     // For public URL generation
-    private String signingKey;                   // For local URL signing
-    
-    // Multipart upload settings
-    private long multipartMinPartSize = 5 * 1024 * 1024;      // 5MB
-    private long multipartMaxPartSize = 5 * 1024 * 1024 * 1024; // 5GB
-    private int multipartMaxParts = 10000;
-    
-    // URL settings
-    private long defaultUrlExpirySeconds = 3600; // 1 hour
-    
+
+    private final ProviderType providerType;
+    private final String basePath;
+    private final String endpoint;
+    private final String region;
+    private final String accessKey;
+    private final String secretKey;
+    private final String sessionToken;
+    private final boolean pathStyleAccess;
+    private final boolean useHttps;
+    private final int connectionTimeout;
+    private final int socketTimeout;
+    private final int maxConnections;
+    private final String bucketPrefix;
+    private final String baseUrl;
+    private final String signingKey;
+    private final long multipartMinPartSize;
+    private final long multipartMaxPartSize;
+    private final int multipartMaxParts;
+    private final long defaultUrlExpirySeconds;
+
     private StorageConfig(Builder builder) {
+        validate(builder);
+
         this.providerType = builder.providerType;
         this.basePath = builder.basePath;
         this.endpoint = builder.endpoint;
@@ -1725,9 +1191,45 @@ public class StorageConfig {
         this.multipartMaxParts = builder.multipartMaxParts;
         this.defaultUrlExpirySeconds = builder.defaultUrlExpirySeconds;
     }
-    
-    public static class Builder {
-        private ProviderType providerType = ProviderType.LOCAL;
+
+    private static void validate(Builder b) {
+        if (b.providerType == null) {
+            throw new IllegalArgumentException("Provider type must be specified");
+        }
+
+        switch (b.providerType) {
+            case LOCAL:
+                if (b.basePath == null || b.basePath.trim().isEmpty()) {
+                    throw new IllegalArgumentException("basePath is required for LOCAL storage");
+                }
+                break;
+
+            case AWS_S3:
+                if (b.region == null || b.region.trim().isEmpty()) {
+                    throw new IllegalArgumentException("region is required for AWS_S3 storage");
+                }
+                if (b.accessKey == null || b.secretKey == null) {
+                    throw new IllegalArgumentException("accessKey and secretKey are required for AWS_S3 storage");
+                }
+                break;
+
+            case MINIO:
+                if (b.endpoint == null || b.endpoint.trim().isEmpty()) {
+                    throw new IllegalArgumentException("endpoint is required for MINIO storage");
+                }
+                if (b.accessKey == null || b.secretKey == null) {
+                    throw new IllegalArgumentException("accessKey and secretKey are required for MINIO storage");
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    public static final class Builder {
+
+        private ProviderType providerType;
         private String basePath = "./storage";
         private String endpoint;
         private String region = "us-east-1";
@@ -1746,138 +1248,189 @@ public class StorageConfig {
         private long multipartMaxPartSize = 5L * 1024 * 1024 * 1024;
         private int multipartMaxParts = 10000;
         private long defaultUrlExpirySeconds = 3600;
-        
+
         public Builder provider(ProviderType type) {
             this.providerType = type;
             return this;
         }
-        
+
         public Builder basePath(String basePath) {
             this.basePath = basePath;
             return this;
         }
-        
+
         public Builder endpoint(String endpoint) {
             this.endpoint = endpoint;
             return this;
         }
-        
+
         public Builder region(String region) {
             this.region = region;
             return this;
         }
-        
+
         public Builder credentials(String accessKey, String secretKey) {
             this.accessKey = accessKey;
             this.secretKey = secretKey;
             return this;
         }
-        
+
         public Builder credentials(String accessKey, String secretKey, String sessionToken) {
             this.accessKey = accessKey;
             this.secretKey = secretKey;
             this.sessionToken = sessionToken;
             return this;
         }
-        
+
         public Builder pathStyleAccess(boolean pathStyleAccess) {
             this.pathStyleAccess = pathStyleAccess;
             return this;
         }
-        
+
         public Builder useHttps(boolean useHttps) {
             this.useHttps = useHttps;
             return this;
         }
-        
+
         public Builder timeouts(int connectionTimeout, int socketTimeout) {
             this.connectionTimeout = connectionTimeout;
             this.socketTimeout = socketTimeout;
             return this;
         }
-        
+
         public Builder maxConnections(int maxConnections) {
             this.maxConnections = maxConnections;
             return this;
         }
-        
+
         public Builder bucketPrefix(String bucketPrefix) {
             this.bucketPrefix = bucketPrefix;
             return this;
         }
-        
+
         public Builder baseUrl(String baseUrl) {
             this.baseUrl = baseUrl;
             return this;
         }
-        
+
         public Builder signingKey(String signingKey) {
             this.signingKey = signingKey;
             return this;
         }
-        
+
         public Builder multipartSettings(long minPartSize, long maxPartSize, int maxParts) {
             this.multipartMinPartSize = minPartSize;
             this.multipartMaxPartSize = maxPartSize;
             this.multipartMaxParts = maxParts;
             return this;
         }
-        
+
         public Builder defaultUrlExpirySeconds(long seconds) {
             this.defaultUrlExpirySeconds = seconds;
             return this;
         }
-        
+
+        public Builder fromProperties(Properties props) {
+            return fromResolver(props::getProperty);
+        }
+
+        public Builder fromMap(Map<String, String> map) {
+            return fromResolver(map::get);
+        }
+
+        public Builder fromResolver(Function<String, String> resolver) {
+
+            String provider = resolver.apply("storage.provider");
+            if (provider != null) {
+                this.providerType = ProviderType.valueOf(provider.toUpperCase());
+            }
+
+            this.basePath = value(resolver, "storage.basePath", this.basePath);
+            this.endpoint = value(resolver, "storage.endpoint", this.endpoint);
+            this.region = value(resolver, "storage.region", this.region);
+            this.accessKey = value(resolver, "storage.accessKey", this.accessKey);
+            this.secretKey = value(resolver, "storage.secretKey", this.secretKey);
+            this.sessionToken = value(resolver, "storage.sessionToken", this.sessionToken);
+            this.baseUrl = value(resolver, "storage.baseUrl", this.baseUrl);
+            this.signingKey = value(resolver, "storage.signingKey", this.signingKey);
+            this.bucketPrefix = value(resolver, "storage.bucketPrefix", this.bucketPrefix);
+
+            String pathStyle = resolver.apply("storage.pathStyleAccess");
+            if (pathStyle != null) {
+                this.pathStyleAccess = Boolean.parseBoolean(pathStyle);
+            }
+
+            String https = resolver.apply("storage.useHttps");
+            if (https != null) {
+                this.useHttps = Boolean.parseBoolean(https);
+            }
+
+            String connTimeout = resolver.apply("storage.connectionTimeout");
+            if (connTimeout != null) {
+                this.connectionTimeout = Integer.parseInt(connTimeout);
+            }
+
+            String sockTimeout = resolver.apply("storage.socketTimeout");
+            if (sockTimeout != null) {
+                this.socketTimeout = Integer.parseInt(sockTimeout);
+            }
+
+            String maxConn = resolver.apply("storage.maxConnections");
+            if (maxConn != null) {
+                this.maxConnections = Integer.parseInt(maxConn);
+            }
+
+            String minPart = resolver.apply("storage.multipart.minPartSize");
+            if (minPart != null) {
+                this.multipartMinPartSize = Long.parseLong(minPart);
+            }
+
+            String maxPart = resolver.apply("storage.multipart.maxPartSize");
+            if (maxPart != null) {
+                this.multipartMaxPartSize = Long.parseLong(maxPart);
+            }
+
+            String maxParts = resolver.apply("storage.multipart.maxParts");
+            if (maxParts != null) {
+                this.multipartMaxParts = Integer.parseInt(maxParts);
+            }
+
+            String expiry = resolver.apply("storage.defaultUrlExpirySeconds");
+            if (expiry != null) {
+                this.defaultUrlExpirySeconds = Long.parseLong(expiry);
+            }
+
+            return this;
+        }
+
+        private String value(Function<String, String> resolver, String key, String current) {
+            String v = resolver.apply(key);
+            return v != null ? v : current;
+        }
+
         public StorageConfig build() {
             return new StorageConfig(this);
         }
     }
-    
-    public static StorageConfig fromProperties(InputStream propsStream) throws Exception {
-        Properties props = new Properties();
-        props.load(propsStream);
-        
-        Builder builder = new Builder();
-        
-        String provider = props.getProperty("storage.provider", "LOCAL");
-        builder.provider(ProviderType.valueOf(provider.toUpperCase()));
-        
-        if (props.containsKey("storage.basePath")) {
-            builder.basePath(props.getProperty("storage.basePath"));
-        }
-        
-        if (props.containsKey("storage.endpoint")) {
-            builder.endpoint(props.getProperty("storage.endpoint"));
-        }
-        
-        if (props.containsKey("storage.region")) {
-            builder.region(props.getProperty("storage.region"));
-        }
-        
-        if (props.containsKey("storage.accessKey") && props.containsKey("storage.secretKey")) {
-            builder.credentials(
-                props.getProperty("storage.accessKey"),
-                props.getProperty("storage.secretKey"),
-                props.getProperty("storage.sessionToken", null)
-            );
-        }
-        
-        if (props.containsKey("storage.pathStyleAccess")) {
-            builder.pathStyleAccess(Boolean.parseBoolean(props.getProperty("storage.pathStyleAccess")));
-        }
-        
-        if (props.containsKey("storage.baseUrl")) {
-            builder.baseUrl(props.getProperty("storage.baseUrl"));
-        }
-        
-        if (props.containsKey("storage.signingKey")) {
-            builder.signingKey(props.getProperty("storage.signingKey"));
-        }
-        
-        return builder.build();
+
+    /**
+     * Convenience plug-and-play entry point.
+     * Reads from JVM system properties first, then OS environment variables.
+     */
+    public static StorageConfig fromSystemEnvironment() {
+        return new Builder()
+                .fromResolver(key -> {
+                    String v = System.getProperty(key);
+                    if (v != null) {
+                        return v;
+                    }
+                    return System.getenv(key.replace('.', '_').toUpperCase());
+                })
+                .build();
     }
-    
+
     // Getters
+
     public ProviderType getProviderType() { return providerType; }
     public String getBasePath() { return basePath; }
     public String getEndpoint() { return endpoint; }
@@ -1899,10 +1452,9 @@ public class StorageConfig {
     public long getDefaultUrlExpirySeconds() { return defaultUrlExpirySeconds; }
 }
 
-
 ===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/src/main/java/com/jjenus/qipi/exception/StorageException.java =====
 
-package com.jjenus.storage.core;
+package com.jjenus.qipi.exception;
 
 public class StorageException extends Exception {
     private final ErrorCode errorCode;
@@ -1921,7 +1473,8 @@ public class StorageException extends Exception {
         URL_GENERATION_ERROR,
         NETWORK_ERROR,
         SERVER_ERROR,
-        VALIDATION_ERROR
+        VALIDATION_ERROR,
+        PROVIDER_ERROR
     }
     
     public StorageException(String message) {
@@ -1952,11 +1505,17 @@ public class StorageException extends Exception {
         this.objectKey = objectKey;
     }
     
+    public StorageException(ErrorCode errorCode, String message, Throwable cause) {
+        super(message, cause);
+        this.errorCode = errorCode;
+        this.bucketName = null;
+        this.objectKey = null;
+    }
+    
     public ErrorCode getErrorCode() { return errorCode; }
     public String getBucketName() { return bucketName; }
     public String getObjectKey() { return objectKey; }
 }
-
 
 ===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/src/main/java/com/jjenus/qipi/model/StorageUrl.java =====
 
@@ -2119,68 +1678,37 @@ public class UploadPartResult {
 package com.jjenus.qipi;
 
 import com.jjenus.qipi.config.StorageConfig;
+import com.jjenus.qipi.exception.StorageException;
 import com.jjenus.qipi.core.Storage;
 import com.jjenus.qipi.providers.LocalStorageProvider;
-import com.jjenus.qipi.providers.S3StorageProvider;
 
-public class StorageFactory {
-    
-    public static Storage createStorage(StorageConfig config) throws Exception {
+public final class StorageFactory {
+
+    private StorageFactory() {
+    }
+
+    public static Storage create(StorageConfig config) throws StorageException {
         switch (config.getProviderType()) {
+
             case LOCAL:
-            case MINIO:  // MinIO uses S3 provider with path style access
+                return new LocalStorageProvider(config);
+
+            case MINIO:
             case AWS_S3:
-                return new S3StorageProvider(config);
+                throw new UnsupportedOperationException(
+                        "S3 provider not yet implemented");
+
+            case GCS:
+            case AZURE_BLOB:
+                throw new UnsupportedOperationException(
+                        "Provider not yet implemented: " + config.getProviderType());
+
             default:
                 throw new IllegalArgumentException(
-                    "Unsupported provider type: " + config.getProviderType()
-                );
+                        "Unsupported provider type: " + config.getProviderType());
         }
-    }
-    
-    public static Storage createStorageFromProperties(String propertiesPath) throws Exception {
-        try (InputStream input = StorageFactory.class.getClassLoader()
-                .getResourceAsStream(propertiesPath)) {
-            if (input == null) {
-                throw new IllegalArgumentException("Properties file not found: " + propertiesPath);
-            }
-            StorageConfig config = StorageConfig.fromProperties(input);
-            return createStorage(config);
-        }
-    }
-    
-    public static Storage createLocalStorage(String basePath) throws Exception {
-        StorageConfig config = new StorageConfig.Builder()
-            .provider(StorageConfig.ProviderType.LOCAL)
-            .basePath(basePath)
-            .baseUrl("http://localhost:8080/files/")
-            .build();
-        return createStorage(config);
-    }
-    
-    public static Storage createMinIOStorage(String endpoint, String accessKey, String secretKey) 
-            throws Exception {
-        StorageConfig config = new StorageConfig.Builder()
-            .provider(StorageConfig.ProviderType.MINIO)
-            .endpoint(endpoint)
-            .region("us-east-1")
-            .credentials(accessKey, secretKey)
-            .pathStyleAccess(true)
-            .build();
-        return createStorage(config);
-    }
-    
-    public static Storage createS3Storage(String region, String accessKey, String secretKey) 
-            throws Exception {
-        StorageConfig config = new StorageConfig.Builder()
-            .provider(StorageConfig.ProviderType.AWS_S3)
-            .region(region)
-            .credentials(accessKey, secretKey)
-            .build();
-        return createStorage(config);
     }
 }
-
 
 ===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/src/main/resources/storage-local.properties =====
 
@@ -2213,11 +1741,13 @@ storage.secretKey=YOUR_AWS_SECRET_KEY
 # Optional: storage.bucketPrefix=myapp
 
 
-===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/examples/FileUploadDemo.java =====
+===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/demo/FileUploadDemo.java =====
+
+package com.jjenus.qipi.demo;
 
 import com.jjenus.qipi.StorageFactory;
+import com.jjenus.qipi.config.StorageConfig;
 import com.jjenus.qipi.core.Storage;
-import com.jjenus.qipi.core.StorageException;
 import com.jjenus.qipi.model.FileInfo;
 import com.jjenus.qipi.model.StorageUrl;
 import com.jjenus.qipi.model.UploadPartResult;
@@ -2226,333 +1756,279 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
 /**
  * Complete demo showing how to use the storage system for user uploads
+ * Fully compatible with StorageFactory.create(StorageConfig)
  */
 public class FileUploadDemo {
-    
+
     private final Storage storage;
-    
+
     public FileUploadDemo(Storage storage) {
         this.storage = storage;
     }
-    
-    /**
-     * Upload a file and return URL for database storage
-     */
-    public UploadResult uploadUserFile(String userId, String fileName, 
+
+    public UploadResult uploadUserFile(String userId, String fileName,
                                        InputStream fileData, long fileSize,
                                        String contentType) throws Exception {
-        
-        // Create user-specific bucket/folder
+
         String bucketName = "user-" + userId;
         if (!storage.bucketExists(bucketName)) {
             storage.createBucket(bucketName);
+            System.out.println("Created bucket: " + bucketName);
         }
-        
-        // Generate unique file key to avoid collisions
+
         String fileKey = generateFileKey(userId, fileName);
-        
-        // Add user metadata
+
         Map<String, String> metadata = new HashMap<>();
         metadata.put("userId", userId);
         metadata.put("originalFileName", fileName);
         metadata.put("uploadTime", String.valueOf(System.currentTimeMillis()));
-        
-        // Upload file
+        metadata.put("contentType", contentType);
+
+        System.out.println("Uploading: " + fileKey + " (" + fileSize + " bytes)");
+
         FileInfo fileInfo = storage.putObject(
-            bucketName, fileKey, fileData, fileSize, contentType, metadata
+                bucketName, fileKey, fileData, fileSize, contentType, metadata
         );
-        
-        // Generate URLs for different purposes
-        StorageUrl publicUrl = storage.generatePublicUrl(bucketName, fileKey);
-        StorageUrl signedUrl = storage.generateSignedUrl(
-            bucketName, fileKey, Storage.HttpMethod.GET, 3600 // 1 hour expiry
-        );
-        
-        return new UploadResult(
-            fileInfo,
-            publicUrl,
-            signedUrl,
-            bucketName + "/" + fileKey  // Path to store in DB
-        );
+
+        System.out.println("Upload complete. ETag: " + fileInfo.getEtag());
+
+        StorageUrl publicUrl = null;
+        StorageUrl signedUrl = null;
+
+        try {
+            publicUrl = storage.generatePublicUrl(bucketName, fileKey);
+            signedUrl = storage.generateSignedUrl(bucketName, fileKey, Storage.HttpMethod.GET, 3600);
+        } catch (Exception e) {
+            System.out.println("Note: URL generation not configured: " + e.getMessage());
+        }
+
+        return new UploadResult(fileInfo, publicUrl, signedUrl, bucketName + "/" + fileKey);
     }
-    
-    /**
-     * Handle large file upload with multipart
-     */
+
     public UploadResult uploadLargeFile(String userId, String fileName,
                                         Path filePath, String contentType) throws Exception {
-        
+
+        System.out.println("\nHandling large file upload...");
+
         String bucketName = "user-" + userId;
         if (!storage.bucketExists(bucketName)) {
             storage.createBucket(bucketName);
         }
-        
+
         String fileKey = generateFileKey(userId, fileName);
         long fileSize = Files.size(filePath);
-        
-        // For files > 100MB, use multipart upload
-        if (fileSize > 100 * 1024 * 1024) {
+
+        System.out.println("File size: " + fileSize + " bytes");
+
+        if (fileSize > 5 * 1024 * 1024) {
+            System.out.println("Using multipart upload (file > 5MB)");
             return multipartUpload(bucketName, fileKey, filePath, contentType, userId);
         } else {
-            // Regular upload for smaller files
+            System.out.println("Using regular upload");
             try (InputStream is = Files.newInputStream(filePath)) {
                 Map<String, String> metadata = new HashMap<>();
                 metadata.put("userId", userId);
                 metadata.put("originalFileName", fileName);
-                
-                FileInfo fileInfo = storage.putObject(
-                    bucketName, fileKey, is, fileSize, contentType, metadata
-                );
-                
-                StorageUrl signedUrl = storage.generateSignedUrl(
-                    bucketName, fileKey, Storage.HttpMethod.GET, 3600
-                );
-                
-                return new UploadResult(
-                    fileInfo,
-                    null,
-                    signedUrl,
-                    bucketName + "/" + fileKey
-                );
+
+                FileInfo fileInfo = storage.putObject(bucketName, fileKey, is, fileSize, contentType, metadata);
+
+                StorageUrl signedUrl = null;
+                try {
+                    signedUrl = storage.generateSignedUrl(bucketName, fileKey, Storage.HttpMethod.GET, 3600);
+                } catch (Exception ignored) {
+                }
+
+                return new UploadResult(fileInfo, null, signedUrl, bucketName + "/" + fileKey);
             }
         }
     }
-    
+
     private UploadResult multipartUpload(String bucketName, String fileKey,
                                          Path filePath, String contentType,
                                          String userId) throws Exception {
-        
-        // Initialize multipart upload
+
         Map<String, String> metadata = new HashMap<>();
         metadata.put("userId", userId);
-        
-        String uploadId = storage.initiateMultipartUpload(
-            bucketName, fileKey, contentType, metadata
-        );
-        
-        // Upload parts (5MB each)
-        long partSize = 5 * 1024 * 1024; // 5MB
+        metadata.put("uploadMethod", "multipart");
+
+        System.out.println("Initiating multipart upload...");
+        String uploadId = storage.initiateMultipartUpload(bucketName, fileKey, contentType, metadata);
+        System.out.println("Upload ID: " + uploadId);
+
+        long partSize = 5 * 1024 * 1024;
         long fileSize = Files.size(filePath);
         int partCount = (int) Math.ceil((double) fileSize / partSize);
-        
+
         List<UploadPartResult> parts = new ArrayList<>();
-        
+
+        System.out.println("Uploading " + partCount + " parts...");
+
         try (RandomAccessFile raf = new RandomAccessFile(filePath.toFile(), "r")) {
             for (int partNumber = 1; partNumber <= partCount; partNumber++) {
                 long startPos = (partNumber - 1) * partSize;
                 long size = Math.min(partSize, fileSize - startPos);
-                
-                // Read part data
-                byte[] partData = new byte[(int)size];
+
+                byte[] partData = new byte[(int) size];
                 raf.seek(startPos);
                 raf.readFully(partData);
-                
-                // Upload part
+
                 try (ByteArrayInputStream bais = new ByteArrayInputStream(partData)) {
-                    UploadPartResult partResult = storage.uploadPart(
-                        bucketName, fileKey, uploadId, partNumber, bais, size
-                    );
+                    UploadPartResult partResult = storage.uploadPart(bucketName, fileKey, uploadId, partNumber, bais, size);
                     parts.add(partResult);
-                    
-                    System.out.println("Uploaded part " + partNumber + " of " + partCount);
+
+                    System.out.print("Part " + partNumber + "/" + partCount + " uploaded\r");
                 }
             }
         }
-        
-        // Complete multipart upload
-        FileInfo fileInfo = storage.completeMultipartUpload(
-            bucketName, fileKey, uploadId, parts
-        );
-        
-        StorageUrl signedUrl = storage.generateSignedUrl(
-            bucketName, fileKey, Storage.HttpMethod.GET, 3600
-        );
-        
-        return new UploadResult(
-            fileInfo,
-            null,
-            signedUrl,
-            bucketName + "/" + fileKey
-        );
+
+        System.out.println("\nAll parts uploaded. Completing multipart upload...");
+
+        FileInfo fileInfo = storage.completeMultipartUpload(bucketName, fileKey, uploadId, parts);
+
+        System.out.println("Multipart upload complete. Final ETag: " + fileInfo.getEtag());
+
+        StorageUrl signedUrl = null;
+        try {
+            signedUrl = storage.generateSignedUrl(bucketName, fileKey, Storage.HttpMethod.GET, 3600);
+        } catch (Exception ignored) {
+        }
+
+        return new UploadResult(fileInfo, null, signedUrl, bucketName + "/" + fileKey);
     }
-    
-    /**
-     * Download file for user
-     */
+
     public void downloadFile(String storagePath, OutputStream outputStream) throws Exception {
         String[] parts = storagePath.split("/", 2);
         String bucketName = parts[0];
         String fileKey = parts[1];
-        
+
+        System.out.println("Downloading: " + fileKey);
+
         try (InputStream is = storage.getObject(bucketName, fileKey)) {
             byte[] buffer = new byte[8192];
             int bytesRead;
+            long totalBytes = 0;
+
             while ((bytesRead = is.read(buffer)) != -1) {
                 outputStream.write(buffer, 0, bytesRead);
+                totalBytes += bytesRead;
             }
+
+            System.out.println("Downloaded " + totalBytes + " bytes");
         }
     }
-    
-    /**
-     * Stream video file (supports range requests)
-     */
-    public void streamVideo(String storagePath, long start, long end, 
-                            OutputStream outputStream) throws Exception {
-        String[] parts = storagePath.split("/", 2);
-        String bucketName = parts[0];
-        String fileKey = parts[1];
-        
-        try (InputStream is = storage.getObjectRange(bucketName, fileKey, start, end)) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = is.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
-            }
-        }
-    }
-    
-    /**
-     * Generate temporary access URL for sharing
-     */
-    public String generateShareLink(String storagePath, long expirySeconds) throws Exception {
-        String[] parts = storagePath.split("/", 2);
-        String bucketName = parts[0];
-        String fileKey = parts[1];
-        
-        StorageUrl signedUrl = storage.generateSignedUrl(
-            bucketName, fileKey, Storage.HttpMethod.GET, expirySeconds
-        );
-        
-        return signedUrl.getUrl().toString();
-    }
-    
-    /**
-     * Generate direct upload URL (for browser uploads)
-     */
-    public StorageUrl generateDirectUploadUrl(String userId, String fileName,
-                                              String contentType) throws Exception {
-        String bucketName = "user-" + userId;
-        String fileKey = generateFileKey(userId, fileName);
-        
-        return storage.generateUploadUrl(
-            bucketName, fileKey, contentType, 3600 // 1 hour to upload
-        );
-    }
-    
-    /**
-     * List user's files
-     */
-    public List<FileInfo> listUserFiles(String userId) throws Exception {
-        String bucketName = "user-" + userId;
-        if (storage.bucketExists(bucketName)) {
-            return storage.listObjects(bucketName);
-        }
-        return new ArrayList<>();
-    }
-    
-    /**
-     * Delete user file
-     */
-    public void deleteFile(String storagePath) throws Exception {
-        String[] parts = storagePath.split("/", 2);
-        String bucketName = parts[0];
-        String fileKey = parts[1];
-        
-        storage.deleteObject(bucketName, fileKey);
-    }
-    
+
     private String generateFileKey(String userId, String fileName) {
         String timestamp = String.valueOf(System.currentTimeMillis());
         String uniqueId = UUID.randomUUID().toString().substring(0, 8);
         return userId + "/" + timestamp + "-" + uniqueId + "-" + fileName;
     }
-    
-    /**
-     * Result of upload operation
-     */
+
     public static class UploadResult {
         private final FileInfo fileInfo;
         private final StorageUrl publicUrl;
         private final StorageUrl signedUrl;
         private final String storagePath;
-        
-        public UploadResult(FileInfo fileInfo, StorageUrl publicUrl, 
-                           StorageUrl signedUrl, String storagePath) {
+
+        public UploadResult(FileInfo fileInfo, StorageUrl publicUrl,
+                            StorageUrl signedUrl, String storagePath) {
             this.fileInfo = fileInfo;
             this.publicUrl = publicUrl;
             this.signedUrl = signedUrl;
             this.storagePath = storagePath;
         }
-        
+
         public FileInfo getFileInfo() { return fileInfo; }
         public StorageUrl getPublicUrl() { return publicUrl; }
         public StorageUrl getSignedUrl() { return signedUrl; }
         public String getStoragePath() { return storagePath; }
-        
-        // This is what you'd store in your database
-        public String getDbValue() {
-            return storagePath;
-        }
+        public String getDbValue() { return storagePath; }
     }
-    
+
     public static void main(String[] args) {
+        System.out.println("\n" + "=".repeat(60));
+        System.out.println("QIPI STORAGE DEMO");
+        System.out.println("=".repeat(60));
+
+        Storage storage = null;
+
         try {
-            // Choose your storage provider by changing this properties file
-            Storage storage = StorageFactory.createStorageFromProperties("storage-local.properties");
-            
-            // Or use MinIO for local S3-compatible storage
-            // Storage storage = StorageFactory.createStorageFromProperties("storage-minio.properties");
-            
-            // Or use AWS S3
-            // Storage storage = StorageFactory.createStorageFromProperties("storage-s3.properties");
-            
+            // Manual storage config, fully self-contained
+            storage = StorageFactory.create(
+                    new StorageConfig.Builder()
+                            .provider(StorageConfig.ProviderType.LOCAL)
+                            .basePath("./qipi-demo-data")
+                            .baseUrl("file://" + Paths.get("./qipi-demo-data").toAbsolutePath() + "/")
+                            .signingKey("demo-signing-key-2026")
+                            .build()
+            );
+
+            System.out.println("Storage initialized");
+
             FileUploadDemo demo = new FileUploadDemo(storage);
-            
-            // Simulate user upload
-            String userId = "user123";
-            String fileName = "profile-photo.jpg";
-            String contentType = "image/jpeg";
-            
-            // Create a dummy file for demo
-            byte[] dummyContent = "This is a test file content".getBytes();
-            
-            try (ByteArrayInputStream bais = new ByteArrayInputStream(dummyContent)) {
-                UploadResult result = demo.uploadUserFile(
-                    userId, fileName, bais, dummyContent.length, contentType
-                );
-                
-                System.out.println("File uploaded successfully!");
-                System.out.println("Store this in DB: " + result.getDbValue());
-                System.out.println("Access URL (valid for 1 hour): " + result.getSignedUrl());
-                
-                // Later, when user wants to download:
-                String storedPath = result.getDbValue();
-                
-                // Generate share link
-                String shareLink = demo.generateShareLink(storedPath, 3600);
-                System.out.println("Share link: " + shareLink);
-                
-                // List user's files
-                List<FileInfo> files = demo.listUserFiles(userId);
-                System.out.println("User has " + files.size() + " files");
-                
-                // Clean up
-                demo.deleteFile(storedPath);
-                System.out.println("File deleted");
-            }
-            
-            storage.close();
-            
+            String userId = "demo-user-" + System.currentTimeMillis() % 10000;
+            System.out.println("\nDemo user: " + userId);
+
         } catch (Exception e) {
+            System.err.println("\nDEMO FAILED: " + e.getMessage());
             e.printStackTrace();
+        } finally {
+            if (storage != null) {
+                try {
+                    storage.close();
+                    System.out.println("\nStorage connection closed");
+                } catch (Exception e) {
+                    System.err.println("Error closing storage: " + e.getMessage());
+                }
+            }
         }
     }
 }
+
+===== /data/data/com.termux/files/home/storage/shared/Workbench/apps/jstorage/qipi/run-demo.sh =====
+
+#!/data/data/com.termux/files/usr/bin/bash
+
+echo "==================================="
+echo "  QIPI Storage Demo - Termux/Java 17"
+echo "==================================="
+
+# Disable Jansi/JLine to avoid native library issues
+export MAVEN_OPTS="-Dorg.jline.terminal.dumb=true -Djansi.passthrough=true"
+
+# Create data directory
+mkdir -p ./qipi-demo-data
+
+# Clean and compile
+echo -e "\n📦 Compiling..."
+mvn clean compile
+
+if [ $? -ne 0 ]; then
+    echo "❌ Compilation failed!"
+    exit 1
+fi
+
+echo "✅ Compilation successful"
+
+# Create a properties file for the demo
+cat > target/classes/storage-demo.properties << EOF
+# Demo Storage Configuration
+storage.provider=LOCAL
+storage.basePath=./qipi-demo-data
+storage.baseUrl=file://$(pwd)/qipi-demo-data/
+storage.signingKey=demo-signing-key-$(date +%s)
+EOF
+
+# Run the demo
+echo -e "\n🎬 Running FileUploadDemo...\n"
+java -cp target/classes \
+     -Dorg.jline.terminal.dumb=true \
+     -Djansi.passthrough=true \
+     -Dfile.encoding=UTF-8 \
+     com.jjenus.qipi.demo.FileUploadDemo \
+     storage-demo.properties
+
+echo -e "\n==================================="
